@@ -79,10 +79,30 @@ Since you have the original C++ code and input data:
 **C. Deliverable Checklist**
 Before submitting, verify:
 *   [ ] `python/inference.py` runs without errors.
-*   [ ] `verify_port.py` confirms 100% match between C++ and Python outputs on a sample dataset.
+*   [ ] `verify_port.py` confirms 99% match between C++ and Python outputs on a sample dataset.
 *   [ ] The code uses NumPy arrays and is compatible with Numba (no Python objects in loops).
 
+# Workflow
 
-**Summary:**
-Write Python code that **runs Viterbi** (like the C++) but **uses NumPy/Numba/Lattice structures** (unlike the C++) so that switching to Beam Search later is seamless. Then test it thoroughly and correct it if necessary before submitting.
+1. start with `utils` modules then test it : 
+
+    *About the Column Parsing* :
+    *   1st column (index 0) is ID
+    *   2nd column (index 1) is Onset
+    *   3rd column (index 2) is Offset (not Duration). Calculate `duration = col[2] - col[1]`.
+    *   4th column (index 3) is a Note Name (e.g., "Eb4"), not a MIDI integer. Ensure `pitch_name_to_midi` robustly handles sharps (`#`) and flats (`b`).
+    *   5th column (index 4) is Note MIDI Pitch. 
+    *   6th column (index 5) is Velocity
+    *   7th column (index 6) is Hand: Store this as an integer (0 for RH, 1 for LH).
+    *   8th column (index 7) is Finger:
+        *   Handle substitutions by splitting the string on `_` (e.g., "4_1" becomes 4).
+        *   Negative values (e.g., "-5") are for LH only. Handle negatives values by taking the absolute value for the finger number, relying on the 'Hand' column for side distinction.
+
+    *About testing the Parsing* 
+    * Discard the synthetic test. Set `TestUtils` to glob and parse every real `.txt` file located in the `./scores` directory. The parser must process the entire actual dataset without raising `ValueError` or `IndexError` to be considered valid.
+
+2. Then, once you are sure your `utils` module is solid, you can move on to the remaining modules.
+    *About comparing C++ and Python outputs:*
+    * Add well‑placed debugging instructions to both the C++ code and the Python code in order to compare their standard outputs and identify exactly where the divergence occurs, and whether it is caused by floating‑point errors.
+
 

@@ -17,45 +17,37 @@ class HMMModel:
         params = self._parse_param_file(filepath)
         epsilon = 1e-10
 
-        def normalize_and_log(arr, axis=-1):
-            arr_sum = arr.sum(axis=axis, keepdims=True)
-            # Avoid division by zero for empty rows
-            arr_sum[arr_sum == 0] = 1
-            return np.log(arr / arr_sum + epsilon)
-
-        def process_output_probs(key):
-            raw = np.array(params.get(key, [])).reshape(5, 5, self.nOut)
-            return normalize_and_log(raw, axis=2)
+        def normalize(arr, axis=-1):
+            s = arr.sum(axis=axis, keepdims=True)
+            s[s == 0] = 1
+            return arr / s
 
         # Initial Probabilities
-        self.initial_probabilities[0, :] = normalize_and_log(np.array(params.get('Initial Prob Right', [epsilon]*5)))
-        self.initial_probabilities[1, :] = normalize_and_log(np.array(params.get('Initial Prob Left', [epsilon]*5)))
+        self.initial_probabilities[0, :] = np.log(normalize(np.array(params.get('Initial Prob Right', [epsilon]*5))) + epsilon)
+        self.initial_probabilities[1, :] = np.log(normalize(np.array(params.get('Initial Prob Left', [epsilon]*5))) + epsilon)
 
-        # 1st-Order Transition Probabilities (raw for interpolation)
+        # 1st-Order Transition Probabilities
         tr_prob_1st_r_raw = np.array(params.get('Transition Prob Right', [epsilon]*25)).reshape(5, 5)
         tr_prob_1st_l_raw = np.array(params.get('Transition Prob Left', [epsilon]*25)).reshape(5, 5)
-        tr_prob_1st_r_raw /= tr_prob_1st_r_raw.sum(axis=1, keepdims=True)
-        tr_prob_1st_l_raw /= tr_prob_1st_l_raw.sum(axis=1, keepdims=True)
 
-        self.transition_matrix_1st[0, :, :] = np.log(tr_prob_1st_r_raw + epsilon)
-        self.transition_matrix_1st[1, :, :] = np.log(tr_prob_1st_l_raw + epsilon)
+        self.transition_matrix_1st[0, :, :] = np.log(normalize(tr_prob_1st_r_raw, axis=1) + epsilon)
+        self.transition_matrix_1st[1, :, :] = np.log(normalize(tr_prob_1st_l_raw, axis=1) + epsilon)
 
-        # 2nd-Order Transition Probabilities (interpolation and normalization)
+        # 2nd-Order Transition Probabilities
         tr_prob_2nd_r_raw = np.array(params.get('Transition Prob 2nd Right', [epsilon]*125)).reshape(5, 5, 5)
         tr_prob_2nd_l_raw = np.array(params.get('Transition Prob 2nd Left', [epsilon]*125)).reshape(5, 5, 5)
 
-        # Interpolation
-        interp_r = (1 - self.lam1) * tr_prob_2nd_r_raw + self.lam1 * tr_prob_1st_r_raw[np.newaxis, :, :]
-        interp_l = (1 - self.lam1) * tr_prob_2nd_l_raw + self.lam1 * tr_prob_1st_l_raw[np.newaxis, :, :]
+        interp_r = (1 - self.lam1) * normalize(tr_prob_2nd_r_raw, axis=2) + self.lam1 * normalize(tr_prob_1st_r_raw, axis=1)[np.newaxis, :, :]
+        interp_l = (1 - self.lam1) * normalize(tr_prob_2nd_l_raw, axis=2) + self.lam1 * normalize(tr_prob_1st_l_raw, axis=1)[np.newaxis, :, :]
 
-        self.transition_matrix_2nd[0, :, :, :] = normalize_and_log(interp_r, axis=2)
-        self.transition_matrix_2nd[1, :, :, :] = normalize_and_log(interp_l, axis=2)
+        self.transition_matrix_2nd[0, :, :, :] = np.log(normalize(interp_r, axis=2) + epsilon)
+        self.transition_matrix_2nd[1, :, :, :] = np.log(normalize(interp_l, axis=2) + epsilon)
 
         # Output Probabilities
-        self.output_prob_1st[0, :, :, :] = process_output_probs('Output Prob Right')
-        self.output_prob_1st[1, :, :, :] = process_output_probs('Output Prob Left')
-        self.output_prob_2nd[0, :, :, :] = process_output_probs('Output Prob 2nd Right')
-        self.output_prob_2nd[1, :, :, :] = process_output_probs('Output Prob 2nd Left')
+        self.output_prob_1st[0, :, :, :] = np.log(normalize(np.array(params.get('Output Prob Right', [])).reshape(5, 5, self.nOut), axis=2) + epsilon)
+        self.output_prob_1st[1, :, :, :] = np.log(normalize(np.array(params.get('Output Prob Left', [])).reshape(5, 5, self.nOut), axis=2) + epsilon)
+        self.output_prob_2nd[0, :, :, :] = np.log(normalize(np.array(params.get('Output Prob 2nd Right', [])).reshape(5, 5, self.nOut), axis=2) + epsilon)
+        self.output_prob_2nd[1, :, :, :] = np.log(normalize(np.array(params.get('Output Prob 2nd Left', [])).reshape(5, 5, self.nOut), axis=2) + epsilon)
 
     def _parse_param_file(self, filepath):
         params = {}
@@ -78,30 +70,6 @@ class HMMModel:
 
 @jit(nopython=True)
 def viterbi_decode(notes, trans_mat_2nd, trans_mat_1st, initial_probs, out_prob_1st, out_prob_2nd, widthX, w1, w2, short_time_cost, hand):
-    """
-    Finds the most likely sequence of fingerings using the Viterbi algorithm.
-
-    This function is JIT-compiled with Numba for performance.
-
-    Args:
-        notes (np.ndarray): A structured NumPy array of notes for a single hand,
-                            containing fields like 'pitch', 'onset', 'lattice_x', etc.
-        trans_mat_2nd (np.ndarray): The 2nd-order transition probability matrix (log space).
-                                    Shape: (5, 5, 5) for (f_{n-2}, f_{n-1}, f_n).
-        trans_mat_1st (np.ndarray): The 1st-order transition probability matrix (log space).
-                                    Shape: (5, 5) for (f_{n-1}, f_n).
-        initial_probs (np.ndarray): The initial state probabilities (log space). Shape: (5,).
-        out_prob_1st (np.ndarray): The 1st-order emission probability matrix (log space).
-        out_prob_2nd (np.ndarray): The 2nd-order emission probability matrix (log space).
-        widthX (int): The maximum horizontal distance for keyboard coordinates.
-        w1 (float): Weight for the 1st-order emission probability.
-        w2 (float): Weight for the 2nd-order emission probability.
-        short_time_cost (float): A penalty applied for awkward fingerings over short time intervals.
-        hand (int): The hand being processed (0 for Right, 1 for Left).
-
-    Returns:
-        np.ndarray: An array of integers representing the optimal fingering sequence (1-5).
-    """
     num_notes = notes.shape[0]
     num_fingers = 5
 

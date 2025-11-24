@@ -1,14 +1,10 @@
-# Virtual environments
-venv/
-.venv/
-env/
+# Compiled binaries
+cpp/Binary/
 
-# Compiled Python files
+# Python cache
 __pycache__/
 *.pyc
-*.pyd
-*.pyo
 
-# IDE-specific files
+# IDE files
 .vscode/
-
+.idea/

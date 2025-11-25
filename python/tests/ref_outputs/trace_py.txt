@@ -1,0 +1,70 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.12, pytest-9.0.1, pluggy-1.6.0 -- /home/jules/.pyenv/versions/3.12.12/bin/python3.12
+cachedir: .pytest_cache
+rootdir: /app
+collecting ... collected 1 item
+
+python/tests/test_viterbi.py::test_viterbi_end_to_end_match FAILED       [100%]
+
+=================================== FAILURES ===================================
+________________________ test_viterbi_end_to_end_match _________________________
+
+    def test_viterbi_end_to_end_match():
+        # 1. Load Data
+        test_dir = os.path.dirname(os.path.abspath(__file__))
+        param_file = os.path.realpath(os.path.join(test_dir, '..', '..', 'cpp', 'Code', 'param_FHMM2.txt'))
+        score_file = os.path.realpath(os.path.join(test_dir, '..', '..', 'scores', '001-1_fingering.txt'))
+        ref_file = os.path.realpath(os.path.join(test_dir, 'ref_outputs', 'ref_001.txt'))
+
+        params = model.HMMParameters(param_file)
+        notes = utils.load_pig_file(score_file)
+        ref_fingers_all = load_reference_fingering(ref_file)
+
+
+        # 2. Process
+        rh_notes = utils.filter_notes_by_hand(notes, 0)
+        ordered_notes = utils.apply_time_dep_pitch_order(rh_notes)
+
+        # 3. Run Viterbi
+        py_fingers = model.viterbi_2nd_order_numba(
+            ordered_notes,
+            params.log_initial_prob,
+            params.log_transition1_prob,
+            params.log_transition2_prob,
+            params.log_output1_prob,
+            params.log_output2_prob,
+            utils.PITCH_TO_KEYPOS_LUT,
+            hand=0,
+            w1=0.5, w2=0.5, short_time_cost=-5.0
+        )
+
+        # 4. Compare
+        ref_rh_fingers = ref_fingers_all[ref_fingers_all > 0]
+>       assert np.array_equal(py_fingers, ref_rh_fingers)
+E       assert False
+E        +  where False = <function array_equal at 0x7f5792113d70>(array([1, 2, 3, 4, 2, 3, 1, 2, 4, 3, 2, 3, 4, 5, 1, 2, 3, 4, 2, 3, 1, 2,\n       4, 3, 2, 3, 4, 2, 5, 4, 3, 2, 4, 3, 5, 4, 3, 2, 1, 2, 4, 3, 5, 4,\n       3, 2, 1, 2, 4, 3, 5, 4, 3, 2, 1, 2, 3, 2, 4, 3, 1, 4, 3, 4, 5, 3,\n       2, 1, 2, 1, 3, 2, 4, 1, 2, 1, 2, 1, 3, 2, 4, 3, 1, 2, 3, 5, 1, 4,\n       3, 2, 1, 1, 1, 2, 3, 4, 2, 3, 1, 2, 1, 2, 3, 4, 2, 3, 1, 2, 4, 3,\n       2, 1, 2, 1, 3, 2, 4, 3, 2, 1, 3, 2, 4, 3, 2, 3, 4, 5, 1, 2, 3, 4,\n       1, 2, 3, 4, 5, 5, 1, 2, 3, 4, 2, 3, 1, 4, 3, 2, 4, 3, 2, 1, 2, 1,\n       5, 4, 5, 4, 2, 3, 2, 1, 4, 3, 2, 1, 4, 3, 2, 1, 1, 5, 4, 3, 2, 4,\n       3, 5, 4, 2, 3, 4, 5, 3, 4, 2, 3, 4, 3, 2, 1, 3, 2, 4, 3, 2, 3, 4,\n       5, 3, 4, 2, 3, 1, 2, 3, 4, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 1, 1, 2,\n       3, 4, 5, 4, 5, 3, 5, 3, 2, 1, 2, 1, 4, 3, 2, 1, 3, 2, 4, 3, 4, 5,\n       2, 1, 5, 2, 4, 1, 2, 4], dtype=int32), array([5, 2, 4, 4, 2, 3, 3, 1, 1, 5, 2, 1, 4, 1, 1, 5, 3, 3, 2, 4, 4, 2,\n       3, 3, 1, 2, 3, 5, 3, 1, 3, 1, 1, 5, 3, 1, 3, 1, 3, 1, 1, 5, 3, 1,\n       3, 5, 4, 5, 4, 5, 4, 5, 4, 5, 2, 4, 4, 2, 1, 4, 2, 3, 5, 4, 1, 1,\n       5, 2, 4, 4, 2, 2, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 1, 2, 3, 3, 1, 3,\n       5, 3, 1, 5, 3, 1, 2, 3, 5, 4, 5, 1, 5, 2, 4, 4, 2, 3, 3, 5, 4, 5,\n       4, 5, 4, 5, 4, 5, 4, 5, 4, 1, 1, 2, 3, 5, 3, 2, 5, 2, 4, 4, 2, 3,\n       3, 1, 5, 2, 4, 4, 2, 1, 4, 2, 3, 5, 3, 1, 3, 5, 3, 1, 3, 1, 1, 5,\n       2, 3, 5, 3, 1, 3, 1, 5, 3, 1, 1, 5, 3, 1, 3, 1, 2, 3, 5, 3, 1, 2,\n       2, 4, 4, 2, 1, 4, 1, 1, 4, 2, 3, 3, 1, 3, 1, 2, 2, 4, 4, 2, 1, 4,\n       1, 3, 1, 5, 3, 2, 5, 2, 3, 5, 3, 2, 5, 2, 1, 4, 3, 5, 3, 2, 5, 2,\n       4, 4, 2, 1, 4, 1, 1, 5, 3, 3, 4, 4, 2, 3, 5, 3, 1, 2, 3, 5, 3, 2,\n       4, 4, 2, 3, 5, 3, 1, 1], dtype=int32))
+E        +    where <function array_equal at 0x7f5792113d70> = np.array_equal
+
+python/tests/test_viterbi.py:54: AssertionError
+----------------------------- Captured stdout call -----------------------------
+STEP 2 HAND 0
+[[ -6.91307476  -3.86576742  -5.98604662  -6.36074917  -9.85626094]
+ [ -7.30027804  -9.42105711  -4.5006014   -8.12121973  -9.13268943]
+ [ -7.04604829  -9.08262711  -8.39036823  -4.61713809  -7.78360907]
+ [ -8.43432562  -9.53279702 -17.53945108  -9.93950945  -5.10627092]
+ [ -9.20002878 -17.20679045  -9.20016395  -9.60542608  -8.69026643]]
+STEP 3 HAND 0
+[[-12.65450704  -9.85111065 -11.85661949 -11.74823022 -13.40769702]
+ [ -9.73026691 -11.01429779  -6.92544573  -9.6003161  -10.59844833]
+ [ -9.67382014 -11.18241858 -11.92923245  -7.40123757 -10.34205659]
+ [-11.11662462 -11.09255728 -15.03091404 -12.13970425  -7.51487964]
+ [-11.97117667 -16.37194003 -12.75197441 -11.54811183 -11.42742995]]
+STEP 4 HAND 0
+[[-15.77319508 -13.60863015 -14.82415274 -14.17821908 -16.03546888]
+ [-15.71561014 -16.99964102 -12.91078896 -15.58565933 -16.58379156]
+ [-12.09866448 -13.60726292 -14.48481208  -9.82608191 -12.76690093]
+ [-13.9007241  -13.87665675 -17.81501352 -14.92380373 -10.29897912]
+ [-14.3797854  -18.78054876 -15.16058314 -13.95672056 -13.83603867]]
+=========================== short test summary info ============================
+FAILED python/tests/test_viterbi.py::test_viterbi_end_to_end_match - assert F...
+============================== 1 failed in 4.11s ===============================

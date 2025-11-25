@@ -58,7 +58,7 @@ NOTE_DTYPE = np.dtype([
 ])
 
 SITCH_REGEX = re.compile(r'([A-G])([#b+-]*)([0-9])')
-COMMENT_REGEX = re.compile(r'(//|#).*')
+COMMENT_REGEX = re.compile(r'//.*|(?<!\S)#.*')
 
 def sitch_to_pitch(sitch: str) -> int:
     if sitch in ("R", "rest"): return -1
@@ -129,7 +129,8 @@ def apply_time_dep_pitch_order(notes: np.ndarray, time_threshold: float = 0.03) 
             j += 1
 
         cluster_notes = notes[cluster_indices]
-        sorted_indices = np.argsort(cluster_notes['pitch'], kind='stable')[::-1]
+        # C++ sorts by -pitch descending, which is pitch ascending.
+        sorted_indices = np.argsort(cluster_notes['pitch'], kind='stable')
         reordered_notes.extend(cluster_notes[sorted_indices])
         i = j
 

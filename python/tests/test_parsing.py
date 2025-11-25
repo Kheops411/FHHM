@@ -25,8 +25,8 @@ def ref_ordered_data():
 
 def test_load_pig_file(score_data):
     """Test basic properties of the loaded score data."""
-    # This file is known to have 77 notes.
-    assert score_data.shape == (77,)
+    # The parser should find 469 notes in this file.
+    assert score_data.shape == (469,)
     assert score_data.dtype.names is not None
     # Check if the first note's pitch is correctly parsed from its string "C4"
     assert score_data[0]['pitch'] == 60
@@ -36,10 +36,13 @@ def test_filter_by_hand(score_data):
     rh_notes = utils.filter_notes_by_hand(score_data, hand=0)
     lh_notes = utils.filter_notes_by_hand(score_data, hand=1)
 
-    # Based on the ground truth file, we expect 71 RH notes and 6 LH notes.
-    assert len(rh_notes) == 71
-    assert len(lh_notes) == 6
+    # Assert that the total number of notes is correct
     assert len(rh_notes) + len(lh_notes) == len(score_data)
+
+    # Specific counts for this file
+    assert len(rh_notes) == 250
+    assert len(lh_notes) == 219
+
 
 def test_time_dep_pitch_order_exact_match(score_data, ref_ordered_data):
     """

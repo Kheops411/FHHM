@@ -2,19 +2,18 @@ import numpy as np
 
 class HMMParameters:
     """
-    A class to load, store, and manage the parameters for the 2nd-order Fingering HMM.
-
-    This class parses the `param_FHMM2.txt` file, which contains the initial, transition (1st and 2nd order),
-    and output (1st and 2nd order) probabilities for both right and left hands.
-
-    All probabilities are immediately converted to log-space upon loading. The values in the file
-    are assumed to be pre-normalized. A small epsilon is added before taking the log to prevent `log(0)`.
+    Loads, stores, and manages parameters for Fingering HMMs of order 2 or 3.
     """
     def __init__(self, filepath: str, log_eps: float = 1e-30):
         self.filepath = filepath
         self.log_eps = log_eps
+        self.order = 2 # Default order
 
-        # Initialize arrays to store log-probabilities
+        with open(self.filepath, 'r') as f:
+            content = f.read()
+            if 'Transition Prob 3rd' in content:
+                self.order = 3
+
         self.log_initial_prob = np.zeros((2, 5), dtype=np.float64)
         self.log_transition1_prob = np.zeros((2, 5, 5), dtype=np.float64)
         self.log_transition2_prob = np.zeros((2, 5, 5, 5), dtype=np.float64)
@@ -22,55 +21,106 @@ class HMMParameters:
         self.log_output1_prob = np.zeros((2, 5, 5, self.n_out), dtype=np.float64)
         self.log_output2_prob = np.zeros((2, 5, 5, self.n_out), dtype=np.float64)
 
+        if self.order == 3:
+            self.log_transition3_prob = np.zeros((2, 5, 5, 5, 5), dtype=np.float64)
+            self.log_output3_prob = np.zeros((2, 5, 5, self.n_out), dtype=np.float64)
+            # lam values from C++ constructor for 3rd order HMM
+            self.lam1 = 0.0
+            self.lam2 = 0.9
+
         self._parse_file()
 
     def _log(self, arr):
         return np.log(arr + self.log_eps)
 
+    def _normalize_and_log(self, arr):
+        """Normalizes a probability vector and converts it to log space."""
+        s = np.sum(arr)
+        if s > 0:
+            arr /= s
+        return self._log(arr)
+
     def _parse_file(self):
         with open(self.filepath, 'r') as f:
             lines = f.readlines()
 
-        line_idx = 0
+        def find_section(marker, start_line=0):
+            for i in range(start_line, len(lines)):
+                if marker in lines[i]:
+                    return i
+            return -1
 
         # --- Parse Initial Probabilities ---
-        for h in range(2):
-            line_idx += 1 # Skip header
-            parts = np.array(list(map(float, lines[line_idx].strip().split())))
-            self.log_initial_prob[h, :] = self._log(parts)
-            line_idx += 1
+        line_idx = find_section('Initial Prob Right') + 1
+        self.log_initial_prob[0, :] = self._log(np.array(list(map(float, lines[line_idx].strip().split()))))
+        line_idx = find_section('Initial Prob Left', line_idx) + 1
+        self.log_initial_prob[1, :] = self._log(np.array(list(map(float, lines[line_idx].strip().split()))))
 
-        # --- Parse 1st Order Transition Probabilities ---
-        for h in range(2):
-            line_idx += 1 # Skip header
-            for prev_f in range(5):
-                parts = np.array(list(map(float, lines[line_idx].strip().split())))
-                self.log_transition1_prob[h, prev_f, :] = self._log(parts)
-                line_idx += 1
-
-        # --- Parse 2nd Order Transition Probabilities ---
-        for h in range(2):
-            line_idx += 1 # Skip header
-            for f_n_minus_2 in range(5):
-                for f_n_minus_1 in range(5):
+        # --- Parse Transitions ---
+        def parse_block(marker, shape):
+            arr = np.zeros(shape)
+            line_idx = find_section(marker) + 1
+            for h in range(shape[0]):
+                it = np.nditer(arr[h, ..., 0], flags=['multi_index'])
+                while not it.finished:
                     parts = np.array(list(map(float, lines[line_idx].strip().split())))
-                    self.log_transition2_prob[h, f_n_minus_2, f_n_minus_1, :] = self._log(parts)
+                    arr[h][it.multi_index] = parts
                     line_idx += 1
+                    it.iternext()
+                line_idx = find_section(marker.replace("Right", "Left"), line_idx) + 1
+            return arr
 
-        # --- Parse 1st Order Output Probabilities ---
-        for h in range(2):
-            line_idx += 1 # Skip header
-            for prev_f in range(5):
-                for curr_f in range(5):
-                    parts = np.array(list(map(float, lines[line_idx].strip().split()[2:])))
-                    self.log_output1_prob[h, prev_f, curr_f, :] = self._log(parts)
-                    line_idx += 1
+        raw_tr1 = parse_block('Transition Prob Right', (2, 5, 5))
+        raw_tr2 = parse_block('Transition Prob 2nd Right', (2, 5, 5, 5))
 
-        # --- Parse 2nd Order Output Probabilities ---
+        if self.order == 3:
+            raw_tr3 = parse_block('Transition Prob 3rd Right', (2, 5, 5, 5, 5))
+            # Apply interpolation
+            for h in range(2):
+                for ippp in range(5):
+                    for ipp in range(5):
+                        for ip in range(5):
+                            raw_tr3[h, ippp, ipp, ip, :] = (1 - self.lam2 - self.lam1) * raw_tr3[h, ippp, ipp, ip, :] + \
+                                                             self.lam2 * raw_tr2[h, ipp, ip, :] + \
+                                                             self.lam1 * raw_tr1[h, ip, :]
+            # Normalize and log
+            for h in range(2):
+                for ippp in range(5):
+                    for ipp in range(5):
+                        for ip in range(5):
+                           self.log_transition3_prob[h, ippp, ipp, ip, :] = self._normalize_and_log(raw_tr3[h, ippp, ipp, ip, :])
+
+        # Normalize and log for order 2 and 1
         for h in range(2):
-            line_idx += 1 # Skip header
-            for prev_f in range(5): # This corresponds to f_n-2
-                for curr_f in range(5): # This corresponds to f_n
-                    parts = np.array(list(map(float, lines[line_idx].strip().split()[2:])))
-                    self.log_output2_prob[h, prev_f, curr_f, :] = self._log(parts)
-                    line_idx += 1
+            for ip in range(5):
+                self.log_transition1_prob[h, ip, :] = self._normalize_and_log(raw_tr1[h, ip, :])
+                for ipp in range(5):
+                    self.log_transition2_prob[h, ipp, ip, :] = self._normalize_and_log(raw_tr2[h, ipp, ip, :])
+
+        # --- Parse Outputs ---
+        def parse_output_block(marker, shape):
+            arr = np.zeros(shape)
+            line_idx = find_section(marker) + 1
+            for h in range(shape[0]):
+                for f1 in range(shape[1]):
+                    for f2 in range(shape[2]):
+                        parts = np.array(list(map(float, lines[line_idx].strip().split()[2:])))
+                        arr[h, f1, f2, :] = parts
+                        line_idx += 1
+                line_idx = find_section(marker.replace("Right", "Left"), line_idx) + 1
+            return arr
+
+        raw_out1 = parse_output_block('Output Prob Right', (2, 5, 5, self.n_out))
+        raw_out2 = parse_output_block('Output Prob 2nd Right', (2, 5, 5, self.n_out))
+        if self.order == 3:
+            raw_out3 = parse_output_block('Output Prob 3rd Right', (2, 5, 5, self.n_out))
+            for h in range(2):
+                for f1 in range(5):
+                    for f2 in range(5):
+                        self.log_output3_prob[h, f1, f2, :] = self._normalize_and_log(raw_out3[h, f1, f2, :])
+
+        for h in range(2):
+            for f1 in range(5):
+                for f2 in range(5):
+                    self.log_output1_prob[h, f1, f2, :] = self._normalize_and_log(raw_out1[h, f1, f2, :])
+                    self.log_output2_prob[h, f1, f2, :] = self._normalize_and_log(raw_out2[h, f1, f2, :])

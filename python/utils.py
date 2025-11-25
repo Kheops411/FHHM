@@ -54,7 +54,7 @@ def lattice_delta_to_index(dx: int, dy: int, width_x: int = 15) -> int:
 NOTE_DTYPE = np.dtype([
     ('original_idx', np.int32), ('ontime', np.float64), ('offtime', np.float64),
     ('pitch_str', 'U10'), ('pitch', np.int32), ('velocity', np.int32),
-    ('channel', np.int32), ('finger_str', 'U20')
+    ('channel', np.int32), ('finger_str', 'U20'), ('finger', np.int32)
 ])
 
 SITCH_REGEX = re.compile(r'([A-G])([#b+-]*)([0-9])')
@@ -74,6 +74,25 @@ def sitch_to_pitch(sitch: str) -> int:
         elif char in ('b', '-'): acc_val -= 1
     return pitch + acc_val
 
+def clean_finger_str(finger_str: str) -> int:
+    """
+    Parses a finger string (e.g., "4_1", "-3") into a single integer.
+    This replicates the C++ `GetKeyPressFingerNum` and `ConvertFingerNumberToInt` logic.
+    """
+    try:
+        # Take the part before any substitution marking
+        cleaned_str = finger_str.split('_')[0]
+        finger_val = int(cleaned_str)
+        # Clamp the values to the valid range [-5, 5], excluding 0.
+        if 0 < finger_val <= 5:
+            return finger_val
+        if -5 <= finger_val < 0:
+            return finger_val
+    except (ValueError, IndexError):
+        pass # Fall through to return 0 if parsing fails
+    return 0 # Default/invalid
+
+
 def load_pig_file(filepath: str) -> np.ndarray:
     """
     Robust, stream-like parser for PIG files.
@@ -84,10 +103,9 @@ def load_pig_file(filepath: str) -> np.ndarray:
     clean_content = COMMENT_REGEX.sub('', content)
     tokens = clean_content.split()
     num_tokens = len(tokens)
-    
-    # C++ reads 8 tokens: ID, ontime, offtime, sitch, onvel, offvel, channel, fingerNum
+
     num_notes = num_tokens // 8
-    
+
     notes = np.zeros(num_notes, dtype=NOTE_DTYPE)
     if num_notes == 0:
         return notes
@@ -98,13 +116,15 @@ def load_pig_file(filepath: str) -> np.ndarray:
             notes[i]['original_idx'] = int(tokens[base])
             notes[i]['ontime']       = float(tokens[base + 1])
             notes[i]['offtime']      = float(tokens[base + 2])
-            notes[i]['pitch_str']    = tokens[base + 3]
-            notes[i]['pitch']        = sitch_to_pitch(tokens[base + 3])
+            pitch_str = tokens[base + 3]
+            notes[i]['pitch_str']    = pitch_str
+            notes[i]['pitch']        = sitch_to_pitch(pitch_str)
             notes[i]['velocity']     = int(tokens[base + 4]) # onvel
-            # offvel (tokens[base + 5]) is ignored in our dtype
             notes[i]['channel']      = int(tokens[base + 6])
-            notes[i]['finger_str']   = tokens[base + 7]
-            
+            finger_str = tokens[base + 7]
+            notes[i]['finger_str']   = finger_str
+            notes[i]['finger']       = clean_finger_str(finger_str)
+
     except (ValueError, IndexError) as e:
         raise ValueError(f"Parsing error at note index {i} (token base {base}): {e}")
 
@@ -144,9 +164,8 @@ def filter_notes_by_hand(notes: np.ndarray, hand: int) -> np.ndarray:
     if notes.shape[0] == 0:
         return np.array([], dtype=notes.dtype)
 
+    # Use the pre-parsed integer 'finger' field for filtering
     if hand == 0: # Right Hand
-        mask = np.array([not f.startswith('-') for f in notes['finger_str']])
-        return notes[mask]
+        return notes[notes['finger'] > 0]
     else: # Left Hand
-        mask = np.array([f.startswith('-') for f in notes['finger_str']])
-        return notes[mask]
+        return notes[notes['finger'] < 0]

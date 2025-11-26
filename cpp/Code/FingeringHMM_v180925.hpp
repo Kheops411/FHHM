@@ -794,6 +794,10 @@ ofs<<"\n";
 
 				for(int kp=0;kp<5;kp+=1){
 				for(int k=0;k<5;k+=1){
+                    if (n < 5) {
+                        cout << "STEP " << n << " HAND " << hand << endl;
+                        for(int dbg_k=0; dbg_k<5; dbg_k++) cout << "LP[" << dbg_k << "]=" << LP[kp][dbg_k] << endl;
+                    }
 					LP[kp][k]=preLP[0][kp]+trProb2[hand][0][kp].LP[k]+w1*outProb[hand][kp][k].LP[3*(keyInt.x+widthX)+keyInt.y+1]+w2*outProb2[hand][0][k].LP[3*(keyInt2.x+widthX)+keyInt2.y+1]
 					          +((shortTime&&((hand==0&&(k-kp)*delPitch<0)||(hand==1&&(k-kp)*delPitch>0)))? shortTimeCost:0)+((shortTime2&&((hand==0&&(k)*delPitch2<0)||(hand==1&&(k)*delPitch2>0)))? shortTimeCost:0);
 					amax[n][kp][k]=0;

@@ -144,6 +144,7 @@ def apply_time_dep_pitch_order(notes: np.ndarray, time_threshold: float = 0.03) 
     while i < len(notes):
         cluster_indices = [i]
         j = i + 1
+        # Corrected logic: compare with previous note in the original sequence
         while j < len(notes) and abs(notes[j]['ontime'] - notes[j-1]['ontime']) < time_threshold:
             cluster_indices.append(j)
             j += 1

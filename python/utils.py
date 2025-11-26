@@ -1,121 +1,172 @@
 import numpy as np
+import numba as nb
+from typing import Tuple
 import re
-import sys
 
-# Pre-compile the regex for performance
-OCTAVE_REGEX = re.compile(r'(-?\d+)$')
+# Global LUT: (128 pitches, 2 coordinates [x, y])
+PITCH_TO_KEYPOS_LUT = np.zeros((128, 2), dtype=np.int16)
 
-def pitch_to_keypos(pitch: int) -> tuple[int, int]:
-    """
-    Converts a MIDI pitch to a keyboard lattice coordinate.
-    """
-    pc = pitch % 12
-    octave = pitch // 12 - 1
-    x = 0
-    if pc in [0, 1]: x = 0
-    elif pc in [2, 3]: x = 1
-    elif pc == 4: x = 2
-    elif pc in [5, 6]: x = 3
-    elif pc in [7, 8]: x = 4
-    elif pc in [9, 10]: x = 5
-    elif pc == 11: x = 6
-    x += 7 * (octave - 4)
-    y = 1 if pc in [1, 3, 6, 8, 10] else 0
-    return (x, y)
+def _compute_pitch_to_keypos_lut():
+    for pitch in range(128):
+        pc = pitch % 12
+        octave = (pitch // 12) - 1
+        x = 0
+        if pc in (0, 1): x = 0
+        elif pc in (2, 3): x = 1
+        elif pc == 4: x = 2
+        elif pc in (5, 6): x = 3
+        elif pc in (7, 8): x = 4
+        elif pc in (9, 10): x = 5
+        elif pc == 11: x = 6
+        x += 7 * (octave - 4)
+        y = 1
+        if pc in (0, 2, 4, 5, 7, 9, 11): y = 0
+        PITCH_TO_KEYPOS_LUT[pitch, 0] = x
+        PITCH_TO_KEYPOS_LUT[pitch, 1] = y
 
-def subtract_keypos(kp1: tuple[int, int], kp2: tuple[int, int]) -> tuple[int, int]:
-    """
-    Calculates the interval from kp2 to kp1.
-    """
+_compute_pitch_to_keypos_lut()
+
+def pitch_to_keypos(midi_pitch: int) -> Tuple[int, int]:
+    if not (0 <= midi_pitch < 128):
+        raise ValueError(f"Pitch {midi_pitch} out of bounds")
+    row = PITCH_TO_KEYPOS_LUT[midi_pitch]
+    return int(row[0]), int(row[1])
+
+def subtract_keypos(kp1: Tuple[int,int], kp2: Tuple[int,int]) -> Tuple[int,int]:
     return (kp1[0] - kp2[0], kp1[1] - kp2[1])
 
-PITCH_TO_KEYPOS_LUT = np.array([pitch_to_keypos(i) for i in range(128)], dtype=np.int16)
+@nb.njit(cache=True)
+def pitch_to_keypos_numba(midi_pitch: int, lut: np.ndarray) -> np.ndarray:
+    return lut[midi_pitch]
+
+@nb.njit(cache=True)
+def subtract_keypos_numba(x1, y1, x2, y2):
+    return x1 - x2, y1 - y2
+
+@nb.njit(cache=True)
+def lattice_delta_to_index(dx: int, dy: int, width_x: int = 15) -> int:
+    if dx < -width_x: dx = -width_x
+    if dx > width_x:  dx = width_x
+    return 3 * (dx + width_x) + dy + 1
+
+# --- Data Parsing & Ordering ---
+
+NOTE_DTYPE = np.dtype([
+    ('original_idx', np.int32), ('ontime', np.float64), ('offtime', np.float64),
+    ('pitch_str', 'U10'), ('pitch', np.int32), ('velocity', np.int32),
+    ('channel', np.int32), ('finger_str', 'U20'), ('finger', np.int32)
+])
+
+SITCH_REGEX = re.compile(r'([A-G])([#b+-]*)([0-9])')
+COMMENT_REGEX = re.compile(r'//.*|(?<!\S)#.*')
 
 def sitch_to_pitch(sitch: str) -> int:
-    """
-    Converts a spelled pitch string (sitch) to a MIDI pitch number.
-    """
-    if sitch in ["R", "rest"]:
-        return -1
-
-    p_rel = {'C': 60, 'D': 62, 'E': 64, 'F': 65, 'G': 67, 'A': 69, 'B': 71}.get(sitch[0])
-    
-    match = OCTAVE_REGEX.search(sitch)
-    if not match:
-        raise ValueError(f"Could not parse octave from sitch: {sitch}")
-    
-    octave = int(match.group(1))
-    accidental_str = sitch[1:match.start()]
-    
+    if sitch in ("R", "rest"): return -1
+    match = SITCH_REGEX.match(sitch)
+    if not match: raise ValueError(f"Invalid pitch string: {sitch}")
+    note_name, accidentals, octave_str = match.groups()
+    p_rel = {'C': 60, 'D': 62, 'E': 64, 'F': 65, 'G': 67, 'A': 69, 'B': 71}[note_name]
+    octave = int(octave_str)
     pitch = p_rel + (octave - 4) * 12
-    
-    if accidental_str in ["#", "+"]: pitch += 1
-    elif accidental_str in ["##", "++"]: pitch += 2
-    elif accidental_str in ["b", "-"]: pitch -= 1
-    elif accidental_str in ["bb", "--"]: pitch -= 2
-        
-    return pitch
-
-def parse_pig_file(filepath: str) -> np.ndarray:
-    """
-    Parses a PIG score file into a structured NumPy array.
-    """
-    records = []
-    with open(filepath, 'r') as f:
-        for line_num, line in enumerate(f, 1):
-            line = line.strip()
-            if not line or line.startswith('//') or line.startswith('#'):
-                continue
-            
-            try:
-                parts = line.split()
-                records.append((int(parts[0]), float(parts[1]), float(parts[2]), 
-                                sitch_to_pitch(parts[3]), int(parts[6]), parts[7]))
-            except (IndexError, ValueError):
-                print(f"Warning: Skipping malformed line {line_num} in {filepath}", file=sys.stderr)
-                continue
-
-    dtype = [('original_idx', 'i4'), ('ontime', 'f8'), ('offtime', 'f8'), 
-             ('pitch', 'i4'), ('channel', 'i4'), ('finger_str', 'U20')]
-    return np.array(records, dtype=dtype)
-
-def sort_notes_by_time(notes: np.ndarray) -> np.ndarray:
-    """
-    Sorts notes based on the time-dependent clustering logic from the C++ code.
-    """
-    if len(notes) == 0:
-        return notes
-
-    clusters, current_cluster = [], [notes[0]]
-    for i in range(1, len(notes)):
-        if abs(notes[i]['ontime'] - notes[i-1]['ontime']) >= 0.03:
-            clusters.append(current_cluster)
-            current_cluster = []
-        current_cluster.append(notes[i])
-    clusters.append(current_cluster)
-
-    sorted_notes = [note for cluster in clusters for note in sorted(cluster, key=lambda x: x['pitch'])]
-    return np.array(sorted_notes, dtype=notes.dtype)
-
-def filter_notes_by_hand(notes: np.ndarray, hand: str) -> np.ndarray:
-    """
-    Filters the structured array to keep only notes for the specified hand.
-    """
-    if len(notes) == 0:
-        return notes
-    is_left = np.char.startswith(notes['finger_str'], '-')
-    if hand == 'left': return notes[is_left]
-    elif hand == 'right': return notes[~is_left]
-    else: raise ValueError("Hand must be 'right' or 'left'")
+    acc_val = 0
+    for char in accidentals:
+        if char in ('#', '+'): acc_val += 1
+        elif char in ('b', '-'): acc_val -= 1
+    return pitch + acc_val
 
 def clean_finger_str(finger_str: str) -> int:
     """
-    Parses the PIG finger string into a simple integer.
+    Parses a finger string (e.g., "4_1", "-3") into a single integer.
+    This replicates the C++ `GetKeyPressFingerNum` and `ConvertFingerNumberToInt` logic.
     """
-    if '_' in finger_str:
-        finger_str = finger_str.split('_')[0]
     try:
-        val = int(finger_str)
-        return val if 1 <= abs(val) <= 5 else 0
-    except ValueError:
-        return 0
+        # Take the part before any substitution marking
+        cleaned_str = finger_str.split('_')[0]
+        finger_val = int(cleaned_str)
+        # Clamp the values to the valid range [-5, 5], excluding 0.
+        if 0 < finger_val <= 5:
+            return finger_val
+        if -5 <= finger_val < 0:
+            return finger_val
+    except (ValueError, IndexError):
+        pass # Fall through to return 0 if parsing fails
+    return 0 # Default/invalid
+
+
+def load_pig_file(filepath: str) -> np.ndarray:
+    """
+    Robust, stream-like parser for PIG files.
+    """
+    with open(filepath, 'r') as f:
+        content = f.read()
+
+    clean_content = COMMENT_REGEX.sub('', content)
+    tokens = clean_content.split()
+    num_tokens = len(tokens)
+
+    num_notes = num_tokens // 8
+
+    notes = np.zeros(num_notes, dtype=NOTE_DTYPE)
+    if num_notes == 0:
+        return notes
+
+    try:
+        for i in range(num_notes):
+            base = i * 8
+            notes[i]['original_idx'] = int(tokens[base])
+            notes[i]['ontime']       = float(tokens[base + 1])
+            notes[i]['offtime']      = float(tokens[base + 2])
+            pitch_str = tokens[base + 3]
+            notes[i]['pitch_str']    = pitch_str
+            notes[i]['pitch']        = sitch_to_pitch(pitch_str)
+            notes[i]['velocity']     = int(tokens[base + 4]) # onvel
+            notes[i]['channel']      = int(tokens[base + 6])
+            finger_str = tokens[base + 7]
+            notes[i]['finger_str']   = finger_str
+            notes[i]['finger']       = clean_finger_str(finger_str)
+
+    except (ValueError, IndexError) as e:
+        raise ValueError(f"Parsing error at note index {i} (token base {base}): {e}")
+
+    return notes
+
+
+def apply_time_dep_pitch_order(notes: np.ndarray, time_threshold: float = 0.03) -> np.ndarray:
+    """
+    Replicates the C++ `TimeDepPitchOrder` logic exactly.
+    """
+    if len(notes) == 0:
+        return notes
+
+    reordered_notes = []
+
+    i = 0
+    while i < len(notes):
+        cluster_indices = [i]
+        j = i + 1
+        # Corrected logic: compare with previous note in the original sequence
+        while j < len(notes) and abs(notes[j]['ontime'] - notes[j-1]['ontime']) < time_threshold:
+            cluster_indices.append(j)
+            j += 1
+
+        cluster_notes = notes[cluster_indices]
+        # C++ sorts by -pitch descending, which is pitch ascending.
+        sorted_indices = np.argsort(cluster_notes['pitch'], kind='stable')
+        reordered_notes.extend(cluster_notes[sorted_indices])
+        i = j
+
+    return np.array(reordered_notes, dtype=notes.dtype)
+
+
+def filter_notes_by_hand(notes: np.ndarray, hand: int) -> np.ndarray:
+    """
+    Filters notes based on the C++ `SelectHandByFingerNum` logic.
+    """
+    if notes.shape[0] == 0:
+        return np.array([], dtype=notes.dtype)
+
+    # Use the pre-parsed integer 'finger' field for filtering
+    if hand == 0: # Right Hand
+        return notes[notes['finger'] > 0]
+    else: # Left Hand
+        return notes[notes['finger'] < 0]

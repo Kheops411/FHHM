@@ -2,11 +2,6 @@ import numpy as np
 import numba as nb
 from typing import Tuple
 import re
-import logging
-
-# Set up logging
-logging.basicConfig(level=logging.WARNING, format='%(levelname)s: %(message)s')
-
 
 # Global LUT: (128 pitches, 2 coordinates [x, y])
 PITCH_TO_KEYPOS_LUT = np.zeros((128, 2), dtype=np.int16)
@@ -63,7 +58,7 @@ NOTE_DTYPE = np.dtype([
 ])
 
 SITCH_REGEX = re.compile(r'([A-G])([#b+-]*)([0-9])')
-COMMENT_REGEX = re.compile(r'//.*|#.*')
+COMMENT_REGEX = re.compile(r'//.*|(?<!\S)#.*')
 
 def sitch_to_pitch(sitch: str) -> int:
     if sitch in ("R", "rest"): return -1
@@ -100,83 +95,83 @@ def clean_finger_str(finger_str: str) -> int:
 
 def load_pig_file(filepath: str) -> np.ndarray:
     """
-    Robust, line-by-line parser for PIG files that correctly handles the 8-column format.
+    Robust, stream-like parser for PIG files.
     """
-    notes_list = []
     with open(filepath, 'r') as f:
-        for line_num, line in enumerate(f, 1):
-            line = COMMENT_REGEX.sub('', line).strip()
-            if not line:
-                continue
+        content = f.read()
 
-            tokens = line.split()
-            if len(tokens) != 8:
-                logging.warning(f"Skipping malformed line {line_num} in {filepath}: "
-                                f"Expected 8 columns, found {len(tokens)}.")
-                continue
+    clean_content = COMMENT_REGEX.sub('', content)
+    tokens = clean_content.split()
+    num_tokens = len(tokens)
 
-            try:
-                # PIG format: idx, ontime, offtime, pitch_str, onvel, offvel, channel, finger_str
-                original_idx = int(float(tokens[0]))
-                ontime       = float(tokens[1])
-                offtime      = float(tokens[2])
-                pitch_str    = tokens[3]
-                pitch        = sitch_to_pitch(pitch_str)
-                velocity     = int(tokens[4]) # onvel
-                channel      = int(tokens[6])
-                finger_str   = tokens[7]
-                finger       = clean_finger_str(finger_str)
+    num_notes = num_tokens // 8
 
-                notes_list.append((original_idx, ontime, offtime, pitch_str, pitch, velocity, channel, finger_str, finger))
+    notes = np.zeros(num_notes, dtype=NOTE_DTYPE)
+    if num_notes == 0:
+        return notes
 
-            except (ValueError, IndexError) as e:
-                logging.warning(f"Skipping malformed note record on line {line_num} in {filepath}: {e}")
-                continue
+    try:
+        for i in range(num_notes):
+            base = i * 8
+            notes[i]['original_idx'] = int(tokens[base])
+            notes[i]['ontime']       = float(tokens[base + 1])
+            notes[i]['offtime']      = float(tokens[base + 2])
+            pitch_str = tokens[base + 3]
+            notes[i]['pitch_str']    = pitch_str
+            notes[i]['pitch']        = sitch_to_pitch(pitch_str)
+            notes[i]['velocity']     = int(tokens[base + 4]) # onvel
+            notes[i]['channel']      = int(tokens[base + 6])
+            finger_str = tokens[base + 7]
+            notes[i]['finger_str']   = finger_str
+            notes[i]['finger']       = clean_finger_str(finger_str)
 
-    return np.array(notes_list, dtype=NOTE_DTYPE)
+    except (ValueError, IndexError) as e:
+        raise ValueError(f"Parsing error at note index {i} (token base {base}): {e}")
+
+    return notes
 
 
 def apply_time_dep_pitch_order(notes: np.ndarray, time_threshold: float = 0.03) -> np.ndarray:
     """
     Replicates the C++ `TimeDepPitchOrder` logic exactly.
+    Groups notes by onset (within 0.03s tolerance) and sorts them by Pitch DESCENDING (High to Low).
     """
     if len(notes) == 0:
         return notes
 
+    # On s'assure que les notes sont triées par temps d'abord pour le clustering
+    notes = np.sort(notes, order=['ontime'])
+    
     reordered_notes = []
 
     i = 0
     while i < len(notes):
         cluster_indices = [i]
         j = i + 1
-        # Corrected logic: compare with previous note in the original sequence
+        # Logic de clustering C++ : on continue tant que l'écart avec la note PRÉCÉDENTE est faible
         while j < len(notes) and abs(notes[j]['ontime'] - notes[j-1]['ontime']) < time_threshold:
             cluster_indices.append(j)
             j += 1
 
         cluster_notes = notes[cluster_indices]
-        # C++ sorts by -pitch descending, which is pitch ascending.
+        
         sorted_indices = np.argsort(cluster_notes['pitch'], kind='stable')
+        
         reordered_notes.extend(cluster_notes[sorted_indices])
         i = j
 
     return np.array(reordered_notes, dtype=notes.dtype)
 
 
-def filter_notes_by_hand(notes: np.ndarray, hand) -> np.ndarray:
+def filter_notes_by_hand(notes: np.ndarray, hand: int) -> np.ndarray:
     """
-    Filters notes for a specific hand.
-    'hand' can be 0 or 'right' for the right hand, 1 or 'left' for the left hand.
+    Filters notes based on the C++ `SelectHandByFingerNum` logic.
     """
     if notes.shape[0] == 0:
         return np.array([], dtype=notes.dtype)
 
-    # In the original data, positive is right, negative is left.
-    # We must also handle notes that have no hand assigned (finger == 0),
-    # which should be excluded from both.
-    if hand == 0 or hand == 'right':
+    # Use the pre-parsed integer 'finger' field for filtering
+    if hand == 0: # Right Hand
         return notes[notes['finger'] > 0]
-    elif hand == 1 or hand == 'left':
+    else: # Left Hand
         return notes[notes['finger'] < 0]
-    else:
-        return np.array([], dtype=notes.dtype)

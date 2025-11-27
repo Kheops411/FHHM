@@ -312,7 +312,7 @@ def run_viterbi(notes: np.ndarray, params: HMMParameters, hand: int = 0) -> np.n
     w1_2 = 0.5
     w2_2 = 0.5
     
-    w1_3 = 1./1.5#0.667
+    w1_3 = 0.667
     w2_3 = 0.5
     w3_3 = 0.2
     

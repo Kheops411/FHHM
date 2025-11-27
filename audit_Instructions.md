@@ -13,8 +13,35 @@ Follow this plan sequentially. Do not proceed to the next phase until the curren
 
 ## **Phase 0: Frequently asked questions**
 
+1. Never ever, modify any of the following files : 
+    - BasicCalculation_v170122.hpp
+    - BasicPitchCalculation_v170101.hpp
+    - CHMM_Run_v190321.cpp
+    - CHMM_Train_v190320.cpp
+    - CHMM_v181128.hpp
+    - ChordFinergingTemplates.txt
+    - Evaluate_MultipleGroundTruth.cpp
+    - Evaluate_SimpleMatchRate.cpp
+    - FingeringEvaluation_v190306.hpp
+    - FingeringHMM1_Run_v181122.cpp
+    - FingeringHMM1_Train_v190308.cpp
+    - FingeringHMM2_Run_v181125.cpp
+    - FingeringHMM2_Train_v190308.cpp
+    - FingeringHMM3_Run_v181125.cpp
+    - FingeringHMM3_Train_v190308.cpp
+    - FingeringHMM_v180925.hpp
+    - KeyPos_v161230.hpp
+    - Midi_v170101.hpp
+    - param_CHMM1.txt
+    - param_FHMM1.txt
+    - param_FHMM2.txt
+    - param_FHMM3.txt
+    - PianoFingering_v170101_2.hpp
+    - PianoRoll_v170503.hpp
+    - ProbabilityVisualizer_v180920.hpp
 
-1. Definition of "Bit-for-Bit Identical"
+
+2. Definition of "Bit-for-Bit Identical"
 
     * Final Output: The final integer sequence of fingerings [f_1, f_2, ..., f_n] produced by the Python port must be an exact, 100% match to the sequence produced by the C++ reference binary for any given input score. There is zero tolerance for deviation here, except for the sign of integers (negative or positive) : Note that in PIG files (.txt), a finger on the left hand is represented with a negative integer. The very first check you have to do is : 
         - Does the python code outputs negative or positive integers for the left hand ?
@@ -25,7 +52,7 @@ Follow this plan sequentially. Do not proceed to the next phase until the curren
 
 The reason for this strictness on the final output is that the Viterbi algorithm is a series of argmax operations. Even a minuscule floating-point difference (1e-10) at a critical step can cause the argmax to select a different path, leading to a completely different final sequence. Therefore, the integer sequence is the non-negotiable ground truth.
 
-2. Third-Order HMM Implementation
+3. Third-Order HMM Implementation
 You should expect to find a separate, dedicated viterbi_3rd_order_numba function.
 
 The first developer's claim that the parameter loader is order-agnostic may be true, but the Viterbi algorithm itself is not. Here is why a separate function is required:
@@ -38,7 +65,7 @@ The first developer's claim that the parameter loader is order-agnostic may be t
 
 Actionable Insight: If a viterbi_3rd_order_numba function (or equivalent) is missing, this is the first major finding of your audit. It would indicate an incomplete implementation that does not fulfill the requirements of the original plan. You should document this as a critical failure.
 
-3. Adversarial Test File Selection
+4. Adversarial Test File Selection
 
 Your instinct to first identify the currently used files is correct. A targeted selection is superior to a random one. I recommend choosing three new files based on these adversarial criteria to stress-test known weak points of the algorithm:
 
@@ -50,7 +77,7 @@ The "Anomalous" Piece: Select a file that looks different from the others.
 Why: To catch "unknown unknowns." Look for a piece with many finger substitutions (e.g., 4_1 notations), unusual rhythmic patterns, or large leaps across the keyboard.
 This strategic selection is designed to maximize the probability of finding bugs that a standard test suite might miss.
 
-4. Handling of Discrepancies
+5. Handling of Discrepancies
 Your primary goal is to REPORT, THEN to fix.
 
 As the auditor, your responsibility is to maintain the integrity of the verification process. Fixing the code as soon as you find an error would invalidate the audit, as you would be testing your own work, not the work delivered by the previous developer.
@@ -72,17 +99,23 @@ The final report should be a clear and factual account of the state of the deliv
 1.  **Repository Checkout & Environment Setup:**
     *   Do not work with files from the `main` branch, use only files from the `feat/fix-hmm-viterbi-logic` branch (using `git checkout -b feat/fix-hmm-viterbi-logic origin/feat/fix-hmm-viterbi-logic)
 `
-    *   Set up your Python environment and install requirements
-        ```bash
-        pip install -r requirements.txt
-        ```
+    *   Set up your Python environment and install requirements in the requirements.txt file
+    *   make sure all requirements (numpy, ...) have been installed properly
     *   Compile the C++ reference code to ensure your environment is sound:
         ```bash
         cd cpp && ./compile.sh && cd ..
         ```
 
 2.  **Initial Test Run:**
-    *   Execute the existing test suite once to establish a baseline.
+    * inspect, verify and correct every `.py` file in the `./python/tests` folder (**Trust nothing; verify everything.**) :
+        * The only legitimate `.txt` files that can be used in any test are:
+            * those you generated yourself
+            * those in scores folder
+            * cpp/Code/param_FHMM2.txt
+            * cpp/Code/param_FHMM2.txt
+        * check : What is the test supposed to test ? Does it do it correctly ? Does it use existing files? Are they legitimate?
+        * corrigcorrects the tests
+    *   Execute the corrected test suite once to establish a baseline.
         ```bash
         pytest -v
         ```

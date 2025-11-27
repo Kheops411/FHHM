@@ -22,10 +22,10 @@ class HMMTrainer:
     def train(self, score_files: list):
         for filepath in score_files:
             notes = utils.load_pig_file(filepath)
-            ordered_notes = utils.apply_time_dep_pitch_order(notes)
 
             for hand in [0, 1]: # 0=RH, 1=LH
-                hand_notes = utils.filter_notes_by_hand(ordered_notes, hand)
+                hand_notes_unord = utils.filter_notes_by_hand(notes, hand)
+                hand_notes = utils.apply_time_dep_pitch_order(hand_notes_unord)
 
                 if len(hand_notes) < self.order:
                     continue

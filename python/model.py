@@ -54,9 +54,9 @@ class HMMParameters:
             return -1
 
         line_idx = find_section('Initial Prob Right') + 1
-        self.log_initial_prob[0, :] = self._normalize_and_log(np.array(list(map(float, lines[line_idx].strip().split()))))
+        self.log_initial_prob[0, :] = self._log(np.array(list(map(float, lines[line_idx].strip().split()))))
         line_idx = find_section('Initial Prob Left', line_idx) + 1
-        self.log_initial_prob[1, :] = self._normalize_and_log(np.array(list(map(float, lines[line_idx].strip().split()))))
+        self.log_initial_prob[1, :] = self._log(np.array(list(map(float, lines[line_idx].strip().split()))))
 
         def parse_block(marker, shape):
             arr = np.zeros(shape)
@@ -127,6 +127,7 @@ class HMMParameters:
                 for f2 in range(5):
                     self.log_output1_prob[h, f1, f2, :] = self._normalize_and_log(raw_out1[h, f1, f2, :])
                     self.log_output2_prob[h, f1, f2, :] = self._normalize_and_log(raw_out2[h, f1, f2, :])
+
 @nb.njit(cache=True)
 def viterbi_2nd_order_numba(
     notes: np.ndarray,
@@ -141,13 +142,17 @@ def viterbi_2nd_order_numba(
     w2: float,
     short_time_cost: float
 ) -> np.ndarray:
+    """
+    Optimized Viterbi for 2nd order HMM. Returns ONLY the optimal path (int32 array).
+    """
     n_obs = len(notes)
     if n_obs < 3:
-        return np.empty(0, dtype=np.int32)
+        # Return empty array if not enough notes
+        return np.zeros(n_obs, dtype=np.int32)
 
     lp = np.full((5, 5), -np.inf, dtype=np.float64)
     amax = np.zeros((n_obs, 5, 5), dtype=np.int32)
-
+    
     for n in range(1, n_obs):
         if n == 1:
             kp1 = utils.pitch_to_keypos_numba(notes[1]['pitch'], pitch_to_keypos_lut)
@@ -215,17 +220,14 @@ def viterbi_2nd_order_numba(
     for n in range(n_obs - 3, -1, -1):
         opt_path[n] = amax[n + 2, opt_path[n + 1], opt_path[n + 2]]
 
-    fingering = (opt_path + 1).astype(np.int32)
-    if hand == 1:
-        return -fingering
-    return fingering
+    return (opt_path + 1).astype(np.int32)
 
 
 @nb.njit(cache=True)
 def viterbi_3rd_order_numba(
     notes: np.ndarray, log_initial_prob: np.ndarray, log_transition1_prob: np.ndarray, log_transition2_prob: np.ndarray, log_transition3_prob: np.ndarray, log_output1_prob: np.ndarray, log_output2_prob: np.ndarray, log_output3_prob: np.ndarray, pitch_to_keypos_lut: np.ndarray, hand: int, w1: float, w2: float, w3: float, short_time_cost: float) -> np.ndarray:
     n_obs = len(notes)
-    if n_obs < 3:
+    if n_obs < 4:
         return np.zeros(n_obs, dtype=np.int32)
     lp = np.full((5, 5, 5), -np.inf, dtype=np.float64)
     amax = np.zeros((n_obs, 5, 5, 5), dtype=np.int32)
@@ -239,11 +241,7 @@ def viterbi_3rd_order_numba(
     for kpp in range(5):
         for kp in range(5):
             for k in range(5):
-                val = (log_initial_prob[hand, kpp] +
-                       log_transition1_prob[hand, kpp, kp] +
-                       log_transition1_prob[hand, kp, k] +
-                       log_output1_prob[hand, kpp, kp, idx_1_0] +
-                       log_output1_prob[hand, kp, k, idx_2_1])
+                val = (log_initial_prob[hand, kpp] + log_transition1_prob[hand, kpp, kp] + log_transition1_prob[hand, kp, k] + log_output1_prob[hand, kpp, kp, idx_1_0] + log_output1_prob[hand, kp, k, idx_2_1])
                 lp[kpp, kp, k] = val
     for n in range(3, n_obs):
         pre_lp = lp.copy()
@@ -302,38 +300,25 @@ def viterbi_3rd_order_numba(
         kp_idx  = opt_path[n+2]
         k_idx   = opt_path[n+3]
         opt_path[n] = amax[n+3, kpp_idx, kp_idx, k_idx]
-
-    fingering = (opt_path + 1).astype(np.int32)
-    if hand == 1:
-        return -fingering
-    return fingering
+    return (opt_path + 1).astype(np.int32)
 
 
-def run_viterbi(notes: np.ndarray, params: HMMParameters, hand: str) -> np.ndarray:
+def run_viterbi(notes: np.ndarray, params: HMMParameters, hand: int = 0) -> np.ndarray:
     """
     Main entry point. Automatically dispatches to the correct Numba function
     based on the HMM order loaded in parameters.
-
-    Args:
-        notes: Structured array of notes (must be sorted!)
-        params: Loaded HMMParameters object
-        hand: 'right' or 'left'
     """
-    # Weights (hardcoded defaults from C++, or could be added to HMMParameters)
-    # 2nd order defaults
+    # Weights (hardcoded defaults from C++)
     w1_2 = 0.5
     w2_2 = 0.5
-
-    # 3rd order defaults
-    w1_3 = 0.667 # approx 1/1.5
-    w2_3 = 0.5   # 1/2
-    w3_3 = 0.2   # 1/5
-
+    
+    w1_3 = 1./1.5#0.667
+    w2_3 = 0.5
+    w3_3 = 0.2
+    
     short_time_cost = -5.0
-
-    hand_int = 0 if hand == 'right' else 1
-
     if params.order == 3:
-        return viterbi_3rd_order_numba(notes, params.log_initial_prob, params.log_transition1_prob, params.log_transition2_prob, params.log_transition3_prob, params.log_output1_prob, params.log_output2_prob, params.log_output3_prob, utils.PITCH_TO_KEYPOS_LUT, hand_int, w1_3, w2_3, w3_3, short_time_cost)
+        return viterbi_3rd_order_numba(notes, params.log_initial_prob, params.log_transition1_prob, params.log_transition2_prob, params.log_transition3_prob, params.log_output1_prob, params.log_output2_prob, params.log_output3_prob, utils.PITCH_TO_KEYPOS_LUT, hand, w1_3, w2_3, w3_3, short_time_cost)
     else:
-        return viterbi_2nd_order_numba(notes, params.log_initial_prob, params.log_transition1_prob, params.log_transition2_prob, params.log_output1_prob, params.log_output2_prob, utils.PITCH_TO_KEYPOS_LUT, hand_int, w1_2, w2_2, short_time_cost)
+        # Note: debug_trace argument removed from call
+        return viterbi_2nd_order_numba(notes, params.log_initial_prob, params.log_transition1_prob, params.log_transition2_prob, params.log_output1_prob, params.log_output2_prob, utils.PITCH_TO_KEYPOS_LUT, hand, w1_2, w2_2, short_time_cost)

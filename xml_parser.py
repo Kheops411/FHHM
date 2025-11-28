@@ -1,789 +1,1437 @@
-#!/usr/bin/env python3
-# musicxml_pianist_parser.py
-# Dependencies: lxml
+"""
+xml_parser.py
+
+Parse MusicXML => produce full "PlayedNote" timeline with comprehensive support for:
+- Structural navigation (repeats, endings, D.C./D.S./Coda/Segno/<sound>)
+- Tuplets, ties, ornaments (trill/mordent/turn), tremolo, glissando, arpeggios
+- Grace notes (make-time or steal-time), articulations, slurs, fermata, pedal
+- Preserves XML refs for fingering injection
+
+Dependencies: lxml
+Usage: python xml_parser.py input.xml output.xml
+"""
 from lxml import etree
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Tuple, Callable
 from collections import defaultdict
-import math
+from enum import IntEnum
 import sys
 
-# ------------------------------
-# Data classes
-# ------------------------------
-@dataclass
-class PlayedNote:
-    hand: int                     # 0 = right, 1 = left
-    pitch: int                    # MIDI number
-    onset: float                  # in fraction of quarter note (quarter = 1.0)
-    duration: float               # in fraction of quarter note
-    offset: float                 # onset + duration
-    velocity: int                 # MIDI velocity (default)
-    xml_element: Optional[etree._Element]  # source <note> if present (None for derived but often present)
-    source_tag: str               # 'note','acciaccatura','ornament','trill', etc.
-    voice: str
-    staff: int
-    measure_number: int
-    extra: dict = field(default_factory=dict)
-    finger: Optional[int] = None  # to be filled by fingering algorithm
+# ============================================================================
+# Constants
+# ============================================================================
 
-# ------------------------------
-# Constants & helpers tonal
-# ------------------------------
-NATURAL_OFFSETS = {'C':0,'D':2,'E':4,'F':5,'G':7,'A':9,'B':11}
-SHARP_ORDER = ['F','C','G','D','A','E','B']
-FLAT_ORDER  = ['B','E','A','D','G','C','F']
+class Hand(IntEnum):
+    """Piano hand enumeration"""
+    RIGHT = 0
+    LEFT = 1
+
+NATURAL_OFFSETS = {'C': 0, 'D': 2, 'E': 4, 'F': 5, 'G': 7, 'A': 9, 'B': 11}
+SHARP_ORDER = ['F', 'C', 'G', 'D', 'A', 'E', 'B']
+FLAT_ORDER = ['B', 'E', 'A', 'D', 'G', 'C', 'F']
+NOTE_INDEX = {'C': 0, 'D': 1, 'E': 2, 'F': 3, 'G': 4, 'A': 5, 'B': 6}
+INDEX_NOTE = {v: k for k, v in NOTE_INDEX.items()}
 
 DEFAULT_VELOCITY = 80
+DEFAULT_DIVISIONS = 480
+DEFAULT_TEMPO = 120.0
 
-def key_fifths_to_alter_map(fifths:int)->Dict[str,int]:
-    m = {s:0 for s in NATURAL_OFFSETS}
-    if fifths>0:
-        for i in range(min(7,fifths)):
-            m[SHARP_ORDER[i]] = 1
-    elif fifths<0:
-        for i in range(min(7,-fifths)):
-            m[FLAT_ORDER[i]] = -1
-    return m
+SUBDIV_MAP = {
+    'whole': 4.0,
+    'half': 2.0,
+    'quarter': 1.0,
+    'eighth': 0.5,
+    '16th': 0.25,
+    '32nd': 0.125,
+}
 
-# Return midi using AccMap + KeySig rules
-def get_midi(step:str, octave:int, accmap:Dict[Tuple[str,int],int], keysig_map:Dict[str,int]) -> int:
-    if step is None or octave is None:
-        return None
-    key = (step, octave)
-    if key in accmap:
-        alter = accmap[key]
-    else:
-        alter = keysig_map.get(step, 0)
-    return (octave + 1) * 12 + NATURAL_OFFSETS[step] + alter
+# Articulation modifications
+ARTICULATION_RATIOS = {
+    'staccatissimo': 0.25,
+    'staccato': 0.5,
+    'portato': 0.75,
+    'tenuto': 0.99,
+    'marcato': 0.95,
+    'accent': 0.95,
+    'sforzando': 0.95,
+}
 
-# Diatonic neighbor (k steps)
-NOTE_INDEX = {'C':0,'D':1,'E':2,'F':3,'G':4,'A':5,'B':6}
-INDEX_NOTE = {v:k for k,v in NOTE_INDEX.items()}
-def get_diatonic_neighbor(step:str, octave:int, k:int, accmap:Dict[Tuple[str,int],int], keysig_map:Dict[str,int]) -> int:
-    if step is None or octave is None:
-        return None
-    idx = NOTE_INDEX[step] + k
-    oct_delta = idx // 7
-    idx_mod = idx % 7
-    target_step = INDEX_NOTE[idx_mod]
-    target_oct = octave + oct_delta
-    return get_midi(target_step, target_oct, accmap, keysig_map)
+VELOCITY_MODIFIERS = {
+    'marcato': 1.2,
+    'accent': 1.2,
+    'sforzando': 1.5,
+}
 
-# convert xml duration (ticks) + divisions -> quarter fraction
-def ticks_to_quarters(ticks:int, divisions:int) -> float:
-    if divisions <= 0: divisions = 1
-    return ticks / divisions
-
-# tempo BPM -> BPS (beats per second)
-def bpm_to_bps(bpm:float) -> float:
-    if bpm is None or bpm <= 0: return 1.0
-    return bpm / 60.0
-
-# ------------------------------
-# Ornaments motif table (diatonic offsets sequences)
-# motifs are lists: (prefix list, body list, suffix list)
-# offset values are diatonic offsets relative to main note
-# ------------------------------
+# Ornament motifs: (prefix, body, suffix) as diatonic offsets
 ORNAMENT_MOTIFS = {
     'Trill': ([], [0, +1], []),
-    'TrillBaroque': ([], [+1,0], [-1,0]),
-    'Mordent': ([0], [ -1, 0], []),  # normalized
+    'TrillBaroque': ([], [+1, 0], [-1, 0]),
+    'Mordent': ([0], [-1, 0], []),
     'UpperMordent': ([0, +1], [], []),
-    'UpMordent': ([-1,0],[+1,0],[-1,0]),
-    'Turn': ([+1,0,-1], [0], []),
-    'InvertedTurn': ([-1,0,+1],[0],[]),
-    'PrallMordent': ([], [+1,0,-1,0], []),
-    'LinePrall': ([+2,+2,+2], [+1,0], [+1,0]),
-    # add more as needed from user's list...
+    'Turn': ([+1, 0, -1], [0], []),
+    'InvertedTurn': ([-1, 0, +1], [0], []),
+    'PrallMordent': ([], [+1, 0, -1, 0], []),
 }
 
-# Minimum supported smallest subdivision preference (in ticks/quaver units)
-# We'll map types to default minimal note duration types for T_sub selection
-ORNAMENT_MIN_DURATION_PREFERENCE = {
-    'Trill': 'semiquaver_div10',    # triple-croche/10 special
-    'TrillBaroque': 'semiquaver_div10',
-    'Mordent': 'semiquaver',        # triple-croche
-    'MordentUp': 'semiquaver',
-    'Turn': 'semiquaver',
-    'Prall': 'semiquaver',
-    # default -> semiquaver
-}
+# Glissando minimum note duration (in quarters)
+GLISSANDO_MIN_NOTE_DURATION = 0.02
 
-# Map textual subdivision names -> fraction of quarter
-SUBDIV_MAP = {
-    'semibreve': 4.0,
-    'minim': 2.0,
-    'quarter': 1.0,
-    'quaver': 0.5,          # croche
-    'semiquaver': 0.25,     # double-croche
-    'demisemiquaver': 0.125,# triple-croche
-}
+# Arpeggio constants
+ARPEGGIO_MAX_OFFSET_MS = 60.0  # milliseconds (0.06 seconds)
+ARPEGGIO_DEFAULT_STRETCH = 1.0
+MIN_NOTE_DURATION = 0.0001  # quarters
 
-# ------------------------------
-# Parser + Expander class
-# ------------------------------
-class PianistMusicXMLParser:
-    def __init__(self, xml_path:str):
+# ============================================================================
+# Data Models
+# ============================================================================
+
+@dataclass
+class PlayedNote:
+    """Represents a single note event in performance time"""
+    hand: int
+    pitch: Optional[int]  # MIDI pitch (None for rest)
+    onset: float  # Quarter note units
+    duration: float  # Quarter note units
+    offset: float  # onset + duration
+    velocity: int
+    xml_element: Optional[etree._Element] = None
+    source_tag: str = 'note'
+    voice: str = '1'
+    staff: int = 1
+    measure_number: int = 0
+    finger: Optional[int] = None
+    extra: dict = field(default_factory=dict)
+
+@dataclass
+class PartState:
+    """State tracking for a musical part"""
+    divisions: int = DEFAULT_DIVISIONS
+    keysig_map: Dict[str, int] = field(default_factory=lambda: {s: 0 for s in NATURAL_OFFSETS})
+    tempo: float = DEFAULT_TEMPO
+    accidentals: Dict[Tuple[str, int], int] = field(default_factory=dict)
+
+# ============================================================================
+# Utility Functions
+# ============================================================================
+
+def key_fifths_to_alter_map(fifths: int) -> Dict[str, int]:
+    """Convert circle of fifths to pitch alterations"""
+    alter_map = {s: 0 for s in NATURAL_OFFSETS}
+    if fifths > 0:
+        for i in range(min(7, fifths)):
+            alter_map[SHARP_ORDER[i]] = 1
+    elif fifths < 0:
+        for i in range(min(7, -fifths)):
+            alter_map[FLAT_ORDER[i]] = -1
+    return alter_map
+
+def get_midi_pitch(
+    step: str,
+    octave: int,
+    accidentals: Dict[Tuple[str, int], int],
+    keysig: Dict[str, int]
+) -> Optional[int]:
+    """Calculate MIDI pitch number"""
+    if step is None or octave is None:
+        return None
+    
+    key = (step, octave)
+    alter = accidentals.get(key, keysig.get(step, 0))
+    return (octave + 1) * 12 + NATURAL_OFFSETS[step] + alter
+
+def get_diatonic_neighbor(
+    step: str,
+    octave: int,
+    offset: int,
+    accidentals: Dict[Tuple[str, int], int],
+    keysig: Dict[str, int]
+) -> Optional[int]:
+    """Get MIDI pitch of diatonic neighbor (for ornaments)"""
+    if step is None or octave is None:
+        return None
+    
+    idx = NOTE_INDEX[step] + offset
+    target_octave = octave + (idx // 7)
+    target_step = INDEX_NOTE[idx % 7]
+    
+    return get_midi_pitch(target_step, target_octave, accidentals, keysig)
+
+def ticks_to_quarters(ticks: int, divisions: int) -> float:
+    """Convert MusicXML duration ticks to quarter note units"""
+    return ticks / max(1, divisions)
+
+def bpm_to_bps(bpm: float) -> float:
+    """Convert beats per minute to beats per second"""
+    return max(bpm, 1.0) / 60.0
+
+def safe_int(text: Optional[str], default: int = 0) -> int:
+    """Safely parse integer from text"""
+    if text is None:
+        return default
+    try:
+        return int(text)
+    except (ValueError, TypeError):
+        return default
+
+def safe_float(text: Optional[str], default: float = 0.0) -> float:
+    """Safely parse float from text"""
+    if text is None:
+        return default
+    try:
+        return float(text)
+    except (ValueError, TypeError):
+        return default
+
+# ============================================================================
+# Structural Navigation
+# ============================================================================
+
+class StructuralNavigator:
+    """
+    Handles structural navigation of score (repeats, endings, D.C./D.S., etc.)
+    Priority: <sound> directives > traditional repeat marks
+    """
+    
+    def __init__(self, part: etree._Element):
+        self.part = part
+        self.measures = part.findall('./measure')
+        self.n = len(self.measures)
+        
+        # Initialize structural markers
+        self.repeat_start = [False] * self.n
+        self.repeat_stop = [None] * self.n  # Times to repeat
+        self.endings = [None] * self.n
+        self.sound_directives = [None] * self.n
+        self.segno_idx = None
+        self.coda_idx = None
+        
+        self._index_structure()
+    
+    def _index_structure(self):
+        """Pre-index all structural elements"""
+        for idx, measure in enumerate(self.measures):
+            # Index repeat barlines
+            for barline in measure.findall('barline'):
+                repeat = barline.find('repeat')
+                if repeat is not None:
+                    direction = repeat.get('direction')
+                    if direction == 'forward':
+                        self.repeat_start[idx] = True
+                    elif direction == 'backward':
+                        times = safe_int(repeat.get('times'), 1)
+                        self.repeat_stop[idx] = times
+            
+            # Index endings (voltas)
+            for ending in measure.findall('ending'):
+                number = ending.get('number')
+                if number:
+                    nums = [safe_int(n.strip()) for n in number.split(',')]
+                    self.endings[idx] = [n for n in nums if n > 0]
+            
+            # Index segno/coda markers
+            for direction in measure.findall('.//direction'):
+                dt = direction.find('direction-type')
+                if dt is not None:
+                    if dt.find('segno') is not None:
+                        self.segno_idx = idx
+                    if dt.find('coda') is not None:
+                        self.coda_idx = idx
+                
+                # Index sound directives
+                sound = direction.find('sound')
+                if sound is not None and sound.attrib:
+                    self.sound_directives[idx] = dict(sound.attrib)
+    
+    def build_play_sequence(self, max_iterations: int = 10000) -> List[int]:
+        """Generate execution order of measures with proper volta handling"""
+        sequence = []
+        idx = 0
+        visit_counts = [0] * self.n
+        volta_passes = defaultdict(int)
+        iterations = 0
+        
+        def find_repeat_start(before: int) -> int:
+            """Find most recent repeat start marker"""
+            for i in range(before, -1, -1):
+                if self.repeat_start[i]:
+                    return i
+            return 0
+        
+        def should_play_measure(measure_idx: int, current_pass: int) -> bool:
+            """Check if measure should be played based on ending/volta"""
+            endings = self.endings[measure_idx]
+            if endings is None:
+                return True
+            return current_pass in endings
+        
+        while idx < self.n and iterations < max_iterations:
+            iterations += 1
+            visit_counts[idx] += 1
+            
+            # Check volta before adding to sequence
+            repeat_start = find_repeat_start(idx)
+            repeat_key = (repeat_start, idx)
+            current_pass = volta_passes.get(repeat_key, 0) + 1
+            
+            if should_play_measure(idx, current_pass):
+                sequence.append(idx)
+            
+            # Process sound directives (priority)
+            sound = self.sound_directives[idx]
+            if sound:
+                if sound.get('dacapo') in ('yes', 'true', '1'):
+                    idx = 0
+                    continue
+                if sound.get('dalsegno') in ('yes', 'true', '1') and self.segno_idx is not None:
+                    idx = self.segno_idx
+                    continue
+                if sound.get('tocoda') in ('yes', 'true', '1') and self.coda_idx is not None:
+                    idx = self.coda_idx
+                    continue
+                if sound.get('fine') in ('yes', 'true', '1'):
+                    break
+            
+            # Process textual directives
+            for direction in self.measures[idx].findall('direction'):
+                words = direction.find('direction-type/words')
+                if words is not None and words.text:
+                    text = words.text.strip().lower()
+                    if 'd.c.' in text or 'da capo' in text:
+                        idx = 0
+                        continue
+                    if ('d.s.' in text or 'dal segno' in text) and self.segno_idx is not None:
+                        idx = self.segno_idx
+                        continue
+                    if ('al coda' in text or 'to coda' in text) and self.coda_idx is not None:
+                        idx = self.coda_idx
+                        continue
+                    if 'fine' in text:
+                        return sequence
+            
+            # Process repeat barlines
+            times = self.repeat_stop[idx]
+            if times:
+                start = find_repeat_start(idx - 1)
+                key = (start, idx)
+                volta_passes[key] += 1
+                
+                if volta_passes[key] <= times:
+                    idx = start
+                    continue
+            
+            idx += 1
+        
+        return sequence
+
+# ============================================================================
+# Main Parser
+# ============================================================================
+
+class MusicXMLParser:
+    """Main parser for MusicXML files"""
+    
+    def __init__(self, xml_path: str):
         self.xml_path = xml_path
         self.tree = etree.parse(xml_path)
         self.root = self.tree.getroot()
         self.played_notes: List[PlayedNote] = []
-        # per part states, keyed by part id
-        self.part_states = defaultdict(lambda: {
-            'divisions': 1,
-            'keysig_map': {s:0 for s in NATURAL_OFFSETS},
-            'tempo': 120.0,
-            'accmap': defaultdict(int),  # reset each measure
-        })
-
-    # main entry
-    def parse_and_expand(self):
+        self.part_states: Dict[int, PartState] = {}
+        self.buffers: Dict[tuple, list] = {}
+        self._chord_start_ticks = 0
+    
+    def parse(self) -> List[PlayedNote]:
+        """Parse MusicXML and generate PlayedNote timeline"""
         parts = self.root.findall('.//part')
+        
         for part in parts:
-            part_id = part.get('id') or 'P'
-            # iterate measures sequentially
-            absolute_measure_index = 0
-            for measure in part.findall('./measure'):
-                absolute_measure_index += 1
-                self._process_measure(part_id, measure, absolute_measure_index)
-        # sort final timeline
-        self.played_notes.sort(key=lambda x:(x.hand, x.onset, x.pitch))
+            part_id = id(part)
+            self.part_states[part_id] = PartState()
+            
+            navigator = StructuralNavigator(part)
+            play_sequence = navigator.build_play_sequence()
+            measures = part.findall('./measure')
+            
+            part_cursor = 0.0
+            
+            for measure_idx in play_sequence:
+                if not (0 <= measure_idx < len(measures)):
+                    continue
+                
+                measure = measures[measure_idx]
+                state = self.part_states[part_id]
+                
+                self._process_attributes(measure, state)
+                measure_cursor = self._process_measure(
+                    measure, part_id, state, part_cursor
+                )
+                part_cursor += measure_cursor
+        
+        self._resolve_ties()
+        self.played_notes.sort(key=lambda x: (x.hand, x.onset, x.pitch or -1))
+        
         return self.played_notes
-
-    def _process_measure(self, part_id:str, measure:etree._Element, measure_number:int):
-        state = self.part_states[part_id]
-        # update attributes (divisions/key/clef) if any
-        attr = measure.find('attributes')
-        if attr is not None:
-            div = attr.findtext('divisions')
-            if div is not None:
-                state['divisions'] = int(div)
-            key = attr.find('key')
-            if key is not None:
-                fifths = key.findtext('fifths')
-                if fifths is not None:
-                    state['keysig_map'] = key_fifths_to_alter_map(int(fifths))
-            # clef ignored for hand heuristics in this version (staff used)
-        # reset measure-level accidental map
-        accmap = defaultdict(int)
-        state['accmap'] = accmap
-
-        # prepare a cursor in ticks (relative to measure). We'll convert to quarters by dividing by divisions.
-        cursor_ticks = 0
-        last_chord_start_ticks = None
-
-        # scan children in measure order (forward/backup supported)
+    
+    def _process_attributes(self, measure: etree._Element, state: PartState):
+        """Process measure attributes (divisions, key, time)"""
+        attributes = measure.find('attributes')
+        if attributes is None:
+            return
+        
+        # Update divisions
+        divisions = attributes.findtext('divisions')
+        if divisions:
+            state.divisions = safe_int(divisions, DEFAULT_DIVISIONS)
+        
+        # Update key signature
+        key = attributes.find('key')
+        if key is not None:
+            fifths = safe_int(key.findtext('fifths'))
+            state.keysig_map = key_fifths_to_alter_map(fifths)
+    
+    def _process_measure(
+        self,
+        measure: etree._Element,
+        part_id: int,
+        state: PartState,
+        measure_onset: float
+    ) -> float:
+        """Process all notes in a measure"""
+        local_ticks = 0
+        state.accidentals.clear()
+        
+        # Reset buffers for this measure
+        self.buffers[('chord_buffer', part_id)] = []
+        self.buffers[('grace_buffer', part_id)] = []
+        self.buffers[('tremolo_buffer', part_id)] = None
+        self.buffers[('glissando_buffer', part_id)] = None
+        
+        # Store all notes for post-processing (glissando target search)
+        measure_notes = []
+        
         for child in measure:
             tag = etree.QName(child.tag).localname
-            if tag == 'forward':
-                dur_node = child.find('duration')
-                if dur_node is not None:
-                    cursor_ticks += int(dur_node.text)
-                continue
+            
             if tag == 'backup':
-                dur_node = child.find('duration')
-                if dur_node is not None:
-                    cursor_ticks = max(0, cursor_ticks - int(dur_node.text))
-                continue
-            if tag == 'direction':
-                self._apply_direction_to_state(child, state)
-                continue
-            if tag != 'note':
-                continue
-            note_elem = child
-            # chord?
-            is_chord = note_elem.find('chord') is not None
-            if not is_chord:
-                last_chord_start_ticks = cursor_ticks
-            start_ticks = last_chord_start_ticks if is_chord else cursor_ticks
-
-            # parse pitch or rest
-            pitch_node = note_elem.find('pitch')
-            is_rest = pitch_node is None
-            step = None; octave = None; alter = None
-            if not is_rest:
-                step = pitch_node.findtext('step')
-                oct_txt = pitch_node.findtext('octave')
-                octave = int(oct_txt) if oct_txt is not None else None
-                alt_node = pitch_node.find('alter')
-                if alt_node is not None:
-                    alter = int(float(alt_node.text))
-                # explicit accidental overrides measure accidental rules
-                acc_node = note_elem.find('accidental')
-                if acc_node is not None and acc_node.text:
-                    txt = acc_node.text.strip().lower()
-                    if txt == 'sharp': alter = 1
-                    elif txt == 'flat': alter = -1
-                    elif txt == 'natural': alter = 0
-                    elif txt == 'double-sharp': alter = 2
-                    elif txt == 'double-flat': alter = -2
-                if alter is not None:
-                    accmap[(step,octave)] = alter
-            # duration ticks (grace may omit)
-            dur_node = note_elem.find('duration')
-            duration_ticks = int(dur_node.text) if dur_node is not None else 0
-            # voice/staff
-            voice = note_elem.findtext('voice','1')
-            staff = int(note_elem.findtext('staff','1'))
-            # ornament detection & articulations
-            notations = note_elem.find('notations')
-            ornaments = []
-            articulations = []
-            if notations is not None:
-                orn_node = notations.find('ornaments')
-                if orn_node is not None:
-                    for o in orn_node:
-                        ornaments.append(etree.QName(o.tag).localname)
-                art_node = notations.find('articulations')
-                if art_node is not None:
-                    for a in art_node:
-                        articulations.append(etree.QName(a.tag).localname)
-                # staccato might also be under articulations
-            # grace?
-            grace_node = note_elem.find('grace')
-            is_grace = grace_node is not None
-            grace_type = None
-            make_time = False
-            if is_grace:
-                # detect acciaccatura slash
-                if 'slash' in grace_node.attrib and grace_node.get('slash') in ('yes','true','1'):
-                    grace_type = 'Acciaccatura'
-                else:
-                    grace_type = 'Appoggiatura'
-                if 'make-time' in grace_node.attrib and grace_node.get('make-time') in ('yes','true','1'):
-                    make_time = True
-
-            # compute midi
-            midi = None
-            if not is_rest:
-                midi = get_midi(step, octave, accmap, state['keysig_map'])
-
-            # build a basic note record (not yet expanded)
-            nominal_quarters = ticks_to_quarters(duration_ticks, state['divisions']) if duration_ticks>0 else 0.0
-            onset_quarters = ticks_to_quarters(start_ticks, state['divisions'])
-            tempo = state.get('tempo', 120.0)
-            # default velocity, may be changed by articulations
-            vel = DEFAULT_VELOCITY
-
-            # handle articulations simple ratio changes
-            art_ratio = 1.0
-            if 'staccatissimo' in articulations:
-                art_ratio = 0.25
-            elif 'staccato' in articulations:
-                art_ratio = 0.5
-            elif 'portato' in articulations:
-                art_ratio = 0.75
-            elif 'tenuto' in articulations:
-                art_ratio = 0.99
-            elif 'marcato' in articulations or 'accent' in articulations:
-                art_ratio = 0.95
-                vel = int(vel * 1.2)
-            # sforzando or subito
-            if 'sforzando' in articulations or 'subito' in articulations:
-                art_ratio = 0.95
-                vel = int(vel * 1.5)
-
-            # if it's a tremolo (notations->tremolo) or note has <tremolo> children, handle in expand_tremolo
-            is_tremolo = note_elem.find('tremolo') is not None
-
-            # Save a compact record for later expansion
-            base_note = {
-                'xml': note_elem,
-                'is_rest': is_rest,
-                'midi': midi,
-                'onset_q': onset_quarters,
-                'nominal_q': nominal_quarters,
-                'duration_ticks': duration_ticks,
-                'voice': voice,
-                'staff': staff,
-                'measure_number': measure_number,
-                'is_chord': is_chord,
-                'is_grace': is_grace,
-                'grace_type': grace_type,
-                'make_time': make_time,
-                'ornaments': ornaments,
-                'articulations': articulations,
-                'is_tremolo': is_tremolo,
-                'tempo': tempo,
-                'accmap_snapshot': dict(accmap),  # for ornament pitch resolution
-                'keysig_map': dict(state['keysig_map']),
-                'velocity': vel
-            }
-
-            # Expand according to type: grace notes / ornaments / tremolo / glissando / normal / chord handled later
-            # If grace: we emit a PlayedNote immediately but defer time-stealing application until all graces for the principal are known.
-            if base_note['is_grace']:
-                # convert to PlayedNote with duration per rules later in grace processing stage
-                # store base note to a buffer attached to measure for post-processing
-                # We'll annotate the xml node with a temporary attribute to link later
-                self._append_grace_candidate(part_id, base_note)
-                # chord cursor: do not advance measure cursor
-                if not is_chord:
-                    cursor_ticks += duration_ticks
-                continue
-
-            # Tremolo handling
-            if base_note['is_tremolo']:
-                self._expand_tremolo_and_append(part_id, base_note)
-                if not is_chord:
-                    cursor_ticks += duration_ticks
-                continue
-
-            # Glissando detection (look for 'glissando' in notations or a <slide> element)
-            if note_elem.find('slide') is not None or note_elem.find('.//glissando') is not None:
-                # For simplicity: look for notation end target via <slide> or tied sequence; best-effort
-                self._expand_glissando_and_append(part_id, base_note)
-                if not is_chord:
-                    cursor_ticks += duration_ticks
-                continue
-
-            # Ornaments handling (trill/mordent/turn/etc.)
-            if base_note['ornaments']:
-                self._expand_ornament_and_append(part_id, base_note)
-                if not is_chord:
-                    cursor_ticks += duration_ticks
-                continue
-
-            # Arpeggio detection: if notations contain 'arpeggiate' then expand chord on flush
-            if base_note['is_chord']:
-                # accumulate to temporary chord buffer in measure-level structure
-                self._append_chord_candidate(part_id, base_note)
-            else:
-                # normal standalone note -> append PlayedNote directly applying articulation ratio
-                duration_real = nominal_quarters * art_ratio
-                pn = PlayedNote(
-                    hand = 1 if staff==2 else 0,
-                    pitch = base_note['midi'],
-                    onset = onset_quarters,
-                    duration = duration_real,
-                    offset = onset_quarters + duration_real,
-                    velocity = base_note['velocity'],
-                    xml_element = base_note['xml'],
-                    source_tag = 'note',
-                    voice = base_note['voice'],
-                    staff = base_note['staff'],
-                    measure_number = base_note['measure_number'],
-                    extra = {'orig_nominal': nominal_quarters, 'art_ratio': art_ratio}
+                duration = safe_int(child.findtext('duration'))
+                local_ticks = max(0, local_ticks - duration)
+            
+            elif tag == 'forward':
+                duration = safe_int(child.findtext('duration'))
+                local_ticks += duration
+            
+            elif tag == 'direction':
+                self._process_direction(child, state)
+            
+            elif tag == 'note':
+                local_ticks = self._process_note(
+                    child, part_id, state, measure_onset, local_ticks, measure, measure_notes
                 )
-                self.played_notes.append(pn)
-                if not is_chord:
-                    cursor_ticks += duration_ticks
-
-        # end measure children
-        # flush any chord buffer present in this measure (we kept chord buffers in an attribute)
-        self._flush_chord_buffers_for_measure(part_id, measure_number, state)
-        # after finishing measure, reset measure-level accidental rules accmap (as per MusicXML)
-        state['accmap'] = defaultdict(int)
-
-    # ------------------------------------------------------------------
-    # Buffers & expansions utilities
-    # The implementation uses simple ephemeral buffers stored on self keyed by part+measure to collect
-    # chord members and grace candidates for post-processing. For simplicity these buffers are dictionaries.
-    # ------------------------------------------------------------------
-    def _append_chord_candidate(self, part_id, base_note):
-        key = ('chord_buffer', part_id)
-        if not hasattr(self, '_buffers'):
-            self._buffers = {}
-        if key not in self._buffers:
-            self._buffers[key] = []
-        self._buffers[key].append(base_note)
-
-    def _flush_chord_buffers_for_measure(self, part_id, measure_number, state):
-        key = ('chord_buffer', part_id)
-        if not hasattr(self, '_buffers') or key not in self._buffers:
-            return
-        chord_buffer = self._buffers.pop(key)
-        # partition buffer into sequential chord groups using same start tick (we assume they were added in order)
-        # group by (onset_q, voice, staff)
-        groups = defaultdict(list)
-        for n in chord_buffer:
-            k = (n['onset_q'], n['voice'], n['staff'])
-            groups[k].append(n)
-        for k, members in groups.items():
-            # detect arpeggiation flag among members
-            has_arpeggio = any(m['xml'].find('.//notations/arpeggiate') is not None or m['xml'].find('arpeggiate') is not None for m in members)
-            self._expand_chord_members_and_append(members, has_arpeggio, state)
-
-    def _append_grace_candidate(self, part_id, base_note):
-        key = ('grace_buffer', part_id)
-        if not hasattr(self, '_buffers'):
-            self._buffers = {}
-        if key not in self._buffers:
-            self._buffers[key] = []
-        self._buffers[key].append(base_note)
-
-    def _flush_graces_for_principal(self, part_id, principal_start_q, principal_nominal_q, principal_xml):
-        # find grace buffer for this part and principal onset
-        key = ('grace_buffer', part_id)
-        if not hasattr(self, '_buffers') or key not in self._buffers:
-            return []
-        buf = self._buffers[key]
-        # select those graces that precede this principal (we used rule: grace notes are attached directly before principal in measure order)
-        # For robustness, pick all graces currently in buffer and apply them sequentially at principal_onset
-        graces = buf[:]  # copy
-        self._buffers[key] = []  # clear buffer after consuming
-        # compute durations per rules
-        n = len(graces)
-        res = []
-        if n == 0:
-            return res
-        # detect types and compute T_grace per rule
-        # convert nominal to quarter fraction
-        T_nom = principal_nominal_q
-        # for each grace compute duration
-        durations = []
-        for g in graces:
-            if g['grace_type'] == 'Acciaccatura':
-                # triple-croche = demisemiquaver = 0.125 (quarter fractions is 1/8? careful)
-                # Here triple-croche = demisemiquaver? we use demisemiquaver = 0.125 (quarter fraction)
-                # rule: min(durée_triple_croche / 2, (0.5 * T_nom) / n)
-                triple = SUBDIV_MAP.get('demisemiquaver', 0.125)
-                t = min(triple/2.0, (0.5 * T_nom) / max(1,n))
-            else:
-                # Appoggiatura
-                # Check composite meter? For now use the rule: if principal dotted (we inspect xml dot) and meter composite detection omitted -> use 2/3
-                dotted = principal_xml.find('dot') is not None
-                if dotted:
-                    t = (2.0/3.0) * T_nom / max(1,n)
-                else:
-                    t = 0.5 * T_nom / max(1,n)
-            durations.append(t)
-        # assign sequential onsets starting at principal onset (on-beat)
-        current = principal_start_q
-        for i,g in enumerate(graces):
-            midi = get_midi(g.get('xml').findtext('pitch/step') if g.get('xml').find('pitch') is not None else None,
-                            int(g.get('xml').findtext('pitch/octave')) if g.get('xml').find('pitch') is not None else None,
-                            g['accmap_snapshot'], g['keysig_map']) if g.get('xml').find('pitch') is not None else None
-            pn = PlayedNote(
-                hand = 1 if g['staff']==2 else 0,
-                pitch = midi,
-                onset = current,
-                duration = durations[i],
-                offset = current + durations[i],
-                velocity = g['velocity'],
-                xml_element = g['xml'],
-                source_tag = 'grace',
-                voice = g['voice'],
-                staff = g['staff'],
-                measure_number = g['measure_number'],
-                extra = {'grace_type': g['grace_type']}
-            )
-            res.append(pn)
-            current += durations[i]
-        # main note will be shifted by sum(durations)
-        return res, sum(durations)
-
-    # ------------------------------------------------------------------
-    # Expansion routines (ornaments, tremolo, glissando, chord arpeggios)
-    # ------------------------------------------------------------------
-    def _expand_ornament_and_append(self, part_id, base_note):
-        # For each ornament in base_note['ornaments'] expand according to motif table
-        for orn in base_note['ornaments']:
-            orn_name = orn  # string like 'trill-mark' etc. translate to motif keys
-            # normalize common names
-            keymap = {
-                'trill-mark':'Trill', 'trill':'Trill','mordent':'Mordent','inverted-mordent':'UpperMordent',
-                'turn':'Turn','inverted-turn':'InvertedTurn','prall':'Prall','prall-mordent':'PrallMordent'
-            }
-            motif_key = keymap.get(orn_name, None)
-            if motif_key is None:
-                # fallback: treat as simple note
-                self._append_simple_note_from_base(base_note)
-                return
-            motif = ORNAMENT_MOTIFS.get(motif_key)
-            if motif is None:
-                # fallback
-                self._append_simple_note_from_base(base_note)
-                return
-            # compute T_sub based on tempo and type (respect Correction 1)
-            bpm = base_note.get('tempo', 120.0)
-            bps = bpm_to_bps(bpm)
-            # default prefer triple-croche
-            if motif_key in ('Trill','TrillBaroque'):
-                # Trill uses special fast slow rule: demisemiquaver / 10 for very slow only for Trill
-                if bps < 1.8:
-                    # use demisemiquaver / 10 -> triple-croche / 10 for very slow
-                    T_sub = SUBDIV_MAP.get('demisemiquaver', 0.125) / 10.0
-                elif bps < 3.0:
-                    T_sub = SUBDIV_MAP.get('demisemiquaver', 0.125)
-                else:
-                    T_sub = SUBDIV_MAP.get('semiquaver', 0.25)
-            else:
-                # Mordents/turns prefer triple-croche baseline
-                if bps < 1.8:
-                    T_sub = SUBDIV_MAP.get('demisemiquaver', 0.125)
-                elif bps < 3.0:
-                    T_sub = SUBDIV_MAP.get('semiquaver', 0.25)
-                else:
-                    T_sub = SUBDIV_MAP.get('quaver', 0.5)
-
-            # build prefix/body/suffix sequences translated to midis using accmap snapshot + keysig_map
-            prefix, body, suffix = motif
-            # compute prefix duration
-            prefix_len = len(prefix) * T_sub
-            suffix_len = len(suffix) * T_sub
-            nominal = base_note['nominal_q']
-            remaining = max(0.0, nominal - prefix_len - suffix_len)
-            body_unit_len = T_sub * max(1, len(body))
-            n_reps = int(remaining // body_unit_len) if body_unit_len>0 else 0
-
-            sequence = []
-            # prefix
-            for off in prefix:
-                midi = get_diatonic_neighbor(base_note.get('xml').findtext('pitch/step') if base_note.get('xml').find('pitch') is not None else None,
-                                             int(base_note.get('xml').findtext('pitch/octave')) if base_note.get('xml').find('pitch') is not None else None,
-                                             off, base_note['accmap_snapshot'], base_note['keysig_map']) if base_note.get('xml').find('pitch') is not None else None
-                sequence.append((midi, T_sub))
-            # body repeated
-            for _ in range(n_reps):
-                for off in body:
-                    midi = get_diatonic_neighbor(base_note.get('xml').findtext('pitch/step') if base_note.get('xml').find('pitch') is not None else None,
-                                                 int(base_note.get('xml').findtext('pitch/octave')) if base_note.get('xml').find('pitch') is not None else None,
-                                                 off, base_note['accmap_snapshot'], base_note['keysig_map']) if base_note.get('xml').find('pitch') is not None else None
-                    sequence.append((midi, T_sub))
-            # suffix
-            for off in suffix:
-                midi = get_diatonic_neighbor(base_note.get('xml').findtext('pitch/step') if base_note.get('xml').find('pitch') is not None else None,
-                                             int(base_note.get('xml').findtext('pitch/octave')) if base_note.get('xml').find('pitch') is not None else None,
-                                             off, base_note['accmap_snapshot'], base_note['keysig_map']) if base_note.get('xml').find('pitch') is not None else None
-                sequence.append((midi, T_sub))
-            # build PlayedNotes sequence starting at base onset
-            onset = base_note['onset_q']
-            for midi, dur in sequence:
-                pn = PlayedNote(
-                    hand = 1 if base_note['staff']==2 else 0,
-                    pitch = midi,
-                    onset = onset,
-                    duration = dur,
-                    offset = onset + dur,
-                    velocity = base_note['velocity'],
-                    xml_element = base_note['xml'],
-                    source_tag = f'ornament:{motif_key}',
-                    voice = base_note['voice'],
-                    staff = base_note['staff'],
-                    measure_number = base_note['measure_number'],
-                    extra = {'ornament': motif_key}
-                )
-                self.played_notes.append(pn)
-                onset += dur
-            # principal note will be shortened or handled by caller (we keep original main note but shorten below)
-            # For simplicity: we do not implicitly append the main note here; caller (original flow) should ensure main note handling
-            return
-
-    def _expand_tremolo_and_append(self, part_id, base_note):
-        # read <tremolo> element and number of strokes
-        tnode = base_note['xml'].find('tremolo')
-        if tnode is None:
-            self._append_simple_note_from_base(base_note)
-            return
-        # determine stroke count by number of <tremolo> inner text or attributes; fallback to typical
-        # in MusicXML, <tremolo> contains <tremolo>child-level/#text = number of strokes? we check 'type' attribute or child value
-        # For safety: if <tremolo> has a 'type' or integer value, use mapping; else treat as 16th repetitions by default
-        # We'll map number of beams: 1 -> 8th, 2->16th,3->32th
-        # Default step = semiquaver (0.25)
-        beams = 2
-        try:
-            beams = int(tnode.text) if tnode.text is not None else beams
-        except:
-            beams = beams
-        if beams == 1:
-            T_step = SUBDIV_MAP.get('quaver',0.5)
-        elif beams == 2:
-            T_step = SUBDIV_MAP.get('semiquaver',0.25)
+        
+        # Post-process: resolve glissando targets
+        self._resolve_glissandos(part_id, measure_notes)
+        
+        # Flush remaining chord buffer
+        self._flush_chord_buffer(part_id, state)
+        
+        return ticks_to_quarters(local_ticks, state.divisions)
+    
+    def _process_direction(self, direction: etree._Element, state: PartState):
+        """Process tempo and other directives"""
+        sound = direction.find('sound')
+        if sound is not None and 'tempo' in sound.attrib:
+            state.tempo = safe_float(sound.get('tempo'), DEFAULT_TEMPO)
+        
+        metronome = direction.find('.//metronome/per-minute')
+        if metronome is not None:
+            state.tempo = safe_float(metronome.text, DEFAULT_TEMPO)
+    
+    def _process_note(
+        self,
+        note: etree._Element,
+        part_id: int,
+        state: PartState,
+        measure_onset: float,
+        local_ticks: int,
+        measure: etree._Element,
+        measure_notes: List[dict]
+    ) -> int:
+        """Process a single note element"""
+        is_chord = note.find('chord') is not None
+        is_grace = note.find('grace') is not None
+        
+        # Handle grace notes
+        if is_grace:
+            grace_info = self._capture_grace_note(note, local_ticks, state, measure)
+            self.buffers[('grace_buffer', part_id)].append(grace_info)
+            duration = safe_int(note.findtext('duration'))
+            return local_ticks + duration if duration and not is_chord else local_ticks
+        
+        # Track chord start position
+        if not is_chord:
+            self._chord_start_ticks = local_ticks
+        
+        # Parse basic note properties
+        pitch_node = note.find('pitch')
+        is_rest = pitch_node is None
+        
+        midi = None
+        step = None
+        octave = None
+        
+        if not is_rest:
+            step = pitch_node.findtext('step')
+            octave = safe_int(pitch_node.findtext('octave'))
+            
+            # Handle alterations
+            alter_node = pitch_node.find('alter')
+            if alter_node is not None:
+                state.accidentals[(step, octave)] = safe_int(alter_node.text)
+            
+            accidental = note.find('accidental')
+            if accidental is not None:
+                alter_value = self._parse_accidental(accidental.text)
+                if alter_value is not None:
+                    state.accidentals[(step, octave)] = alter_value
+            
+            midi = get_midi_pitch(step, octave, state.accidentals, state.keysig_map)
+        
+        # Duration and tuplets
+        duration = safe_int(note.findtext('duration'))
+        duration_factor = self._get_tuplet_factor(note)
+        
+        # Voice and staff
+        voice = note.findtext('voice', '1')
+        staff = safe_int(note.findtext('staff'), 1)
+        
+        # Calculate timing
+        onset_ticks = self._chord_start_ticks if is_chord else local_ticks
+        onset = measure_onset + ticks_to_quarters(onset_ticks, state.divisions)
+        nominal_duration = ticks_to_quarters(duration, state.divisions) * duration_factor
+        
+        # Parse notations
+        notations = note.find('notations')
+        ornaments = self._get_ornaments(notations)
+        articulations = self._get_articulations(note)
+        
+        # Detect tremolo type
+        tremolo_node = notations.find('tremolo') if notations is not None else None
+        tremolo_type = None
+        tremolo_beams = 2
+        if tremolo_node is not None:
+            tremolo_type = tremolo_node.get('type', 'single')
+            if tremolo_node.text and tremolo_node.text.strip().isdigit():
+                tremolo_beams = int(tremolo_node.text.strip())
+        
+        is_tremolo_single = tremolo_type == 'single' or (tremolo_node is not None and tremolo_type is None)
+        is_tremolo_start = tremolo_type == 'start'
+        is_tremolo_stop = tremolo_type == 'stop'
+        
+        # Detect glissando/slide
+        glissando_node = notations.find('glissando') if notations is not None else None
+        slide_node = notations.find('slide') if notations is not None else None
+        glissando_type = None
+        if glissando_node is not None:
+            glissando_type = glissando_node.get('type', 'start')
+        elif slide_node is not None:
+            glissando_type = slide_node.get('type', 'start')
+        
+        is_glissando_start = glissando_type == 'start'
+        is_glissando_stop = glissando_type == 'stop'
+        
+        is_arpeggiate = notations is not None and notations.find('arpeggiate') is not None
+        
+        # Velocity
+        velocity = self._calculate_velocity(articulations)
+        art_ratio = self._get_articulation_ratio(articulations)
+        
+        # Build note info dict
+        note_info = {
+            'xml': note,
+            'is_rest': is_rest,
+            'midi': midi,
+            'step': step,
+            'octave': octave,
+            'onset_q': onset,
+            'nominal_q': nominal_duration,
+            'duration_ticks': duration,
+            'voice': voice,
+            'staff': staff,
+            'measure_number': safe_int(measure.get('number')),
+            'is_chord': is_chord,
+            'ornaments': ornaments,
+            'articulations': articulations,
+            'is_tremolo_single': is_tremolo_single,
+            'is_tremolo_start': is_tremolo_start,
+            'is_tremolo_stop': is_tremolo_stop,
+            'tremolo_beams': tremolo_beams,
+            'is_glissando_start': is_glissando_start,
+            'is_glissando_stop': is_glissando_stop,
+            'arpeggiate': is_arpeggiate,
+            'tempo': state.tempo,
+            'accmap_snapshot': dict(state.accidentals),
+            'keysig_map': dict(state.keysig_map),
+            'velocity': velocity,
+            'art_ratio': art_ratio,
+            'onset_ticks': onset_ticks
+        }
+        
+        # Store for glissando resolution
+        measure_notes.append(note_info)
+        
+        # Handle chords vs single notes
+        if is_chord:
+            self.buffers[('chord_buffer', part_id)].append(note_info)
         else:
-            T_step = SUBDIV_MAP.get('demisemiquaver',0.125)
-        # repeat main note every T_step until nominal filled
-        onset = base_note['onset_q']
-        remaining = base_note['nominal_q']
-        while remaining > 1e-9:
-            dur = min(T_step, remaining)
-            pn = PlayedNote(
-                hand = 1 if base_note['staff']==2 else 0,
-                pitch = base_note['midi'],
-                onset = onset,
-                duration = dur,
-                offset = onset + dur,
-                velocity = base_note['velocity'],
-                xml_element = base_note['xml'],
-                source_tag = 'tremolo',
-                voice = base_note['voice'],
-                staff = base_note['staff'],
-                measure_number = base_note['measure_number'],
-                extra = {'tremolo_beams': beams}
-            )
-            self.played_notes.append(pn)
-            onset += dur
-            remaining -= dur
-
-    def _expand_glissando_and_append(self, part_id, base_note):
-        # naive best-effort: find next tied or adjacent note in same voice that has slide/gliss target; otherwise skip
-        # For demonstration we'll skip complex detection and append the base note as-is
-        self._append_simple_note_from_base(base_note)
-
-    def _append_simple_note_from_base(self, base_note):
-        # apply articulation ratio if any
-        art_ratio = 1.0
-        if base_note['articulations']:
-            if 'staccatissimo' in base_note['articulations']:
-                art_ratio = 0.25
-            elif 'staccato' in base_note['articulations']:
-                art_ratio = 0.5
-            elif 'portato' in base_note['articulations']:
-                art_ratio = 0.75
-            elif 'tenuto' in base_note['articulations']:
-                art_ratio = 0.99
-            elif 'marcato' in base_note['articulations'] or 'accent' in base_note['articulations']:
-                art_ratio = 0.95
-                base_note['velocity'] = int(base_note['velocity'] * 1.2)
-        duration_real = base_note['nominal_q'] * art_ratio
-        pn = PlayedNote(
-            hand = 1 if base_note['staff']==2 else 0,
-            pitch = base_note['midi'],
-            onset = base_note['onset_q'],
-            duration = duration_real,
-            offset = base_note['onset_q'] + duration_real,
-            velocity = base_note['velocity'],
-            xml_element = base_note['xml'],
-            source_tag = 'note',
-            voice = base_note['voice'],
-            staff = base_note['staff'],
-            measure_number = base_note['measure_number'],
-            extra = {'orig_nominal': base_note['nominal_q']}
+            # Check for tremolo two-note start
+            if is_tremolo_start:
+                self.buffers[('tremolo_buffer', part_id)] = note_info
+                # Don't process yet, wait for stop note
+            elif is_tremolo_stop:
+                # Process tremolo pair
+                tremolo_start = self.buffers.get(('tremolo_buffer', part_id))
+                if tremolo_start:
+                    self._expand_tremolo_two_notes(tremolo_start, note_info)
+                    self.buffers[('tremolo_buffer', part_id)] = None
+                else:
+                    # Fallback: treat as simple note
+                    self._process_single_note(note_info, part_id)
+            # Check for glissando start
+            elif is_glissando_start:
+                self.buffers[('glissando_buffer', part_id)] = note_info
+                # Will be resolved in post-processing
+            else:
+                # Normal single note processing
+                self._process_single_note(note_info, part_id)
+        
+        return local_ticks + duration if not is_chord else local_ticks
+    
+    def _process_single_note(self, note_info: dict, part_id: int):
+        """Process a single note (not part of chord, tremolo, or glissando)"""
+        # Flush grace notes before principal
+        grace_result = self._flush_graces_for_principal(part_id, note_info)
+        if grace_result:
+            grace_notes, time_shift = grace_result
+            self.played_notes.extend(grace_notes)
+            note_info['onset_q'] += time_shift
+            note_info['nominal_q'] = max(0.0001, note_info['nominal_q'] - time_shift)
+        
+        # Process based on type
+        if note_info['is_tremolo_single']:
+            self._expand_tremolo(note_info)
+        elif note_info['ornaments']:
+            self._expand_ornament(note_info)
+        else:
+            self._append_simple_note(note_info)
+    
+    def _parse_accidental(self, text: Optional[str]) -> Optional[int]:
+        """Parse accidental text to alteration value"""
+        if not text:
+            return None
+        
+        accidental_map = {
+            'sharp': 1,
+            'flat': -1,
+            'natural': 0,
+            'double-sharp': 2,
+            'double-flat': -2,
+        }
+        return accidental_map.get(text.strip().lower())
+    
+    def _get_tuplet_factor(self, note: etree._Element) -> float:
+        """Calculate duration factor for tuplets"""
+        time_mod = note.find('time-modification')
+        if time_mod is None:
+            return 1.0
+        
+        actual = safe_int(time_mod.findtext('actual-notes'), 1)
+        normal = safe_int(time_mod.findtext('normal-notes'), 1)
+        
+        return normal / actual if actual > 0 else 1.0
+    
+    def _get_articulations(self, note: etree._Element) -> List[str]:
+        """Extract articulation markings"""
+        articulations = []
+        notations = note.find('notations')
+        if notations is not None:
+            art_node = notations.find('articulations')
+            if art_node is not None:
+                for art in art_node:
+                    articulations.append(etree.QName(art.tag).localname)
+        return articulations
+    
+    def _get_ornaments(self, notations: Optional[etree._Element]) -> List[str]:
+        """Extract ornament markings"""
+        ornaments = []
+        if notations is not None:
+            orn_node = notations.find('ornaments')
+            if orn_node is not None:
+                for orn in orn_node:
+                    ornaments.append(etree.QName(orn.tag).localname)
+        return ornaments
+    
+    def _calculate_velocity(self, articulations: List[str]) -> int:
+        """Calculate MIDI velocity based on articulations"""
+        velocity = DEFAULT_VELOCITY
+        for art in articulations:
+            modifier = VELOCITY_MODIFIERS.get(art, 1.0)
+            velocity = int(velocity * modifier)
+        return min(127, velocity)
+    
+    def _get_articulation_ratio(self, articulations: List[str]) -> float:
+        """Get duration ratio for articulations"""
+        for art in articulations:
+            if art in ARTICULATION_RATIOS:
+                return ARTICULATION_RATIOS[art]
+        return 1.0
+    
+    def _append_simple_note(self, note_info: dict):
+        """Append a simple note to played_notes"""
+        duration = note_info['nominal_q'] * note_info['art_ratio']
+        if duration <= 0:
+            duration = 0.0001
+        
+        played_note = PlayedNote(
+            hand=Hand.LEFT if note_info['staff'] == 2 else Hand.RIGHT,
+            pitch=note_info['midi'],
+            onset=note_info['onset_q'],
+            duration=duration,
+            offset=note_info['onset_q'] + duration,
+            velocity=note_info['velocity'],
+            xml_element=note_info['xml'],
+            source_tag='note',
+            voice=note_info['voice'],
+            staff=note_info['staff'],
+            measure_number=note_info['measure_number'],
         )
-        self.played_notes.append(pn)
-
-    def _expand_chord_members_and_append(self, members:list, has_arpeggio:bool, state:dict):
-        # members: list of base_note dicts sharing same onset_q and staff/voice
-        # compute nominal (take max nominal among members for safety)
+        self.played_notes.append(played_note)
+    
+    def _capture_grace_note(
+        self,
+        note: etree._Element,
+        local_ticks: int,
+        state: PartState,
+        measure: etree._Element
+    ) -> dict:
+        """Capture grace note information for later processing"""
+        pitch_node = note.find('pitch')
+        step = None
+        octave = None
+        
+        if pitch_node is not None:
+            step = pitch_node.findtext('step')
+            octave = safe_int(pitch_node.findtext('octave'))
+        
+        grace_node = note.find('grace')
+        grace_type = 'Appoggiatura'
+        if grace_node is not None and grace_node.get('slash') in ('yes', 'true', '1'):
+            grace_type = 'Acciaccatura'
+        
+        make_time = False
+        if grace_node is not None and grace_node.get('make-time') in ('yes', 'true', '1'):
+            make_time = True
+        
+        return {
+            'xml': note,
+            'step': step,
+            'octave': octave,
+            'accmap_snapshot': dict(state.accidentals),
+            'keysig_map': dict(state.keysig_map),
+            'staff': safe_int(note.findtext('staff'), 1),
+            'voice': note.findtext('voice', '1'),
+            'measure_number': safe_int(measure.get('number')),
+            'grace_type': grace_type,
+            'make_time': make_time,
+            'velocity': DEFAULT_VELOCITY,
+        }
+    
+    def _flush_graces_for_principal(
+        self,
+        part_id: int,
+        principal_info: dict
+    ) -> Optional[Tuple[List[PlayedNote], float]]:
+        """Flush accumulated grace notes before a principal note"""
+        key = ('grace_buffer', part_id)
+        if key not in self.buffers or not self.buffers[key]:
+            return None
+        
+        graces = self.buffers[key]
+        self.buffers[key] = []
+        
+        n = len(graces)
+        principal_onset = principal_info['onset_q']
+        principal_duration = principal_info['nominal_q']
+        principal_xml = principal_info['xml']
+        
+        # Calculate durations for each grace
+        durations = []
+        for grace in graces:
+            if grace['grace_type'] == 'Acciaccatura':
+                # Very short
+                t = min(SUBDIV_MAP['32nd'] / 2.0, (0.5 * principal_duration) / max(1, n))
+            else:
+                # Appoggiatura - steal from principal
+                is_dotted = principal_xml.find('dot') is not None
+                if is_dotted:
+                    t = (2.0 / 3.0) * principal_duration / max(1, n)
+                else:
+                    t = 0.5 * principal_duration / max(1, n)
+            durations.append(t)
+        
+        total_shift = sum(durations)
+        
+        # Create grace note events
+        grace_notes = []
+        current_onset = principal_onset
+        
+        for grace, duration in zip(graces, durations):
+            midi = None
+            if grace['step'] is not None:
+                midi = get_midi_pitch(
+                    grace['step'],
+                    grace['octave'],
+                    grace['accmap_snapshot'],
+                    grace['keysig_map']
+                )
+            
+            played_note = PlayedNote(
+                hand=Hand.LEFT if grace['staff'] == 2 else Hand.RIGHT,
+                pitch=midi,
+                onset=current_onset,
+                duration=duration,
+                offset=current_onset + duration,
+                velocity=grace['velocity'],
+                xml_element=grace['xml'],
+                source_tag=f"grace:{grace['grace_type']}",
+                voice=grace['voice'],
+                staff=grace['staff'],
+                measure_number=grace['measure_number'],
+            )
+            grace_notes.append(played_note)
+            current_onset += duration
+        
+        return (grace_notes, total_shift)
+    
+    def _flush_chord_buffer(self, part_id: int, state: PartState):
+        """Flush and expand chord buffer with arpeggio support"""
+        key = ('chord_buffer', part_id)
+        if key not in self.buffers or not self.buffers[key]:
+            return
+        
+        chord_notes = self.buffers[key]
+        self.buffers[key] = []
+        
+        # Group by onset (absolute time) - DO NOT separate by voice/staff for arpeggios
+        groups_by_onset = defaultdict(list)
+        for note_info in chord_notes:
+            onset_key = note_info['onset_q']
+            groups_by_onset[onset_key].append(note_info)
+        
+        # Process each onset group
+        for onset, notes_at_onset in groups_by_onset.items():
+            # Separate arpeggiated from non-arpeggiated notes
+            arpeggiated = []
+            non_arpeggiated = []
+            
+            for note_info in notes_at_onset:
+                if note_info['arpeggiate']:
+                    arpeggiated.append(note_info)
+                else:
+                    non_arpeggiated.append(note_info)
+            
+            # Further group arpeggiated notes by arpeggio number if present
+            if arpeggiated:
+                arp_groups = self._group_arpeggios_by_number(arpeggiated)
+                for arp_group in arp_groups:
+                    self._expand_arpeggio_group(arp_group, state)
+            
+            # Process non-arpeggiated notes as regular chords
+            if non_arpeggiated:
+                # Group by voice/staff for regular chords
+                regular_groups = defaultdict(list)
+                for note_info in non_arpeggiated:
+                    k = (note_info['voice'], note_info['staff'])
+                    regular_groups[k].append(note_info)
+                
+                for group in regular_groups.values():
+                    self._expand_chord_group(group, state, arpeggio=False)
+    
+    def _group_arpeggios_by_number(self, arpeggiated_notes: List[dict]) -> List[List[dict]]:
+        """Group arpeggiated notes by their arpeggio number attribute"""
+        # Extract arpeggio numbers from XML
+        groups_by_number = defaultdict(list)
+        
+        for note_info in arpeggiated_notes:
+            arp_node = note_info['xml'].find('.//arpeggiate')
+            if arp_node is not None:
+                number = arp_node.get('number')
+                if number:
+                    groups_by_number[number].append(note_info)
+                else:
+                    # No number specified - group with other unnumbered arpeggios
+                    groups_by_number[None].append(note_info)
+            else:
+                groups_by_number[None].append(note_info)
+        
+        return list(groups_by_number.values())
+    
+    def _expand_arpeggio_group(self, members: List[dict], state: PartState):
+        """Expand an arpeggio group spanning potentially multiple staves"""
         if not members:
             return
+        
+        N = len(members)
+        
+        # Get nominal duration (maximum of all notes in group)
+        nominal = max(m['nominal_q'] for m in members)
+        
+        # Sort by MIDI pitch (ascending, grave to aigu)
+        member_list = [(m['midi'] or 0, m) for m in members]
+        member_list.sort(key=lambda x: x[0])
+        
+        # Detect direction (check if ANY note has direction="down")
+        is_descending = False
+        for m in members:
+            arp_node = m['xml'].find('.//arpeggiate')
+            if arp_node is not None:
+                direction = arp_node.get('direction', '').lower()
+                if 'down' in direction:
+                    is_descending = True
+                    break
+        
+        # Apply direction: reverse if descending
+        if is_descending:
+            member_list = list(reversed(member_list))
+        
+        # Calculate timing
+        tempo_bpm = state.tempo
+        
+        # Convert max offset from milliseconds to quarters based on tempo
+        # MaxOffsetQuarters = 0.06 * (TempoBPM / 60.0)
+        max_offset_quarters = (ARPEGGIO_MAX_OFFSET_MS / 1000.0) * (tempo_bpm / 60.0)
+        
+        # Raw step: divide total duration by number of notes
+        raw_step = nominal / N if N > 0 else 0.0
+        
+        # Actual offset step: minimum of raw step and max offset
+        offset_step = min(raw_step, max_offset_quarters)
+        
+        # Base onset
+        base_onset = members[0]['onset_q']
+        
+        # Generate events with staggered onsets
+        for i, (midi, note_info) in enumerate(member_list):
+            # Calculate delay for this note
+            delay = offset_step * i * ARPEGGIO_DEFAULT_STRETCH
+            
+            # Real onset = base + delay
+            real_onset = base_onset + delay
+            
+            # Real duration = original nominal - delay (time compression)
+            # The note must end at the same absolute time as if not arpeggiated
+            real_duration = max(MIN_NOTE_DURATION, nominal - delay)
+            
+            played_note = PlayedNote(
+                hand=Hand.LEFT if note_info['staff'] == 2 else Hand.RIGHT,
+                pitch=midi,
+                onset=real_onset,
+                duration=real_duration,
+                offset=real_onset + real_duration,
+                velocity=note_info['velocity'],
+                xml_element=note_info['xml'],
+                source_tag='arpeggio_note',
+                voice=note_info['voice'],
+                staff=note_info['staff'],
+                measure_number=note_info['measure_number'],
+                extra={'arpeggio_size': N, 'arpeggio_index': i, 'arpeggio_delay': delay}
+            )
+            self.played_notes.append(played_note)
+    
+    def _expand_chord_group(self, members: List[dict], state: PartState, arpeggio: bool = True):
+        """Expand a regular chord group (non-arpeggiated, deprecated)"""
+        # This method is kept for backward compatibility but should not be used for arpeggios
+        if not members:
+            return
+        
         nominal = max(m['nominal_q'] for m in members)
         N = len(members)
-        # tempo -> BPS for MaxStepQuarters
-        bpm = members[0].get('tempo', 120.0)
-        bps = bpm_to_bps(bpm)
-        max_step_quarters = 0.06 * bps  # Correction 2 applied
-        if has_arpeggio:
-            step_time = min(nominal / N if N>0 else 0.0, max_step_quarters)
-        else:
-            step_time = 0.0
-        # sort according to arpeggiate direction; default ascending by pitch
-        # retrieve midi for each member
-        member_infos = []
-        for m in members:
-            member_infos.append((m['midi'], m))
-        member_infos.sort(key=lambda x:x[0])  # asc
-        # if some member xml indicates arpeggiate-down, invert
-        # simple heuristic: if any member has <arpeggiate type="down"> then reverse
-        arpeggiate_down = any(m['xml'].find('.//arpeggiate') is not None and m['xml'].find('.//arpeggiate').get('direction')=='down' for _,m in member_infos)
-        ordered = [mi for mi,_ in (reversed(member_infos) if arpeggiate_down else member_infos)]
-        # expand each with onset shift and adjusted duration (end same absolute time)
+        
+        # Sort by pitch
+        member_list = [(m['midi'] or 0, m) for m in members]
+        member_list.sort(key=lambda x: x[0])
+        
         base_onset = members[0]['onset_q']
-        for i, (midi, m) in enumerate(member_infos if not arpeggiate_down else list(reversed(member_infos))):
-            # compute onset_i
-            onset_i = base_onset + i * step_time
-            duration_i = max(0.0001, nominal - i * step_time)
-            pn = PlayedNote(
-                hand = 1 if m['staff']==2 else 0,
-                pitch = midi,
-                onset = onset_i,
-                duration = duration_i,
-                offset = onset_i + duration_i,
-                velocity = m['velocity'],
-                xml_element = m['xml'],
-                source_tag = 'arp_chord' if has_arpeggio else 'chord_note',
-                voice = m['voice'],
-                staff = m['staff'],
-                measure_number = m['measure_number'],
-                extra = {'chord_size': N, 'chord_index': i}
+        
+        # Regular chord: all notes start simultaneously
+        for i, (midi, note_info) in enumerate(member_list):
+            played_note = PlayedNote(
+                hand=Hand.LEFT if note_info['staff'] == 2 else Hand.RIGHT,
+                pitch=midi,
+                onset=base_onset,
+                duration=nominal,
+                offset=base_onset + nominal,
+                velocity=note_info['velocity'],
+                xml_element=note_info['xml'],
+                source_tag='chord_note',
+                voice=note_info['voice'],
+                staff=note_info['staff'],
+                measure_number=note_info['measure_number'],
+                extra={'chord_size': N, 'chord_index': i}
             )
-            self.played_notes.append(pn)
+            self.played_notes.append(played_note)
+    
+    def _expand_tremolo(self, note_info: dict):
+        """Expand tremolo into rapid repeated notes"""
+        tremolo_node = note_info['xml'].find('.//tremolo')
+        
+        # Determine subdivision from beams/slashes
+        beams = note_info.get('tremolo_beams', 2)
+        
+        # Map beams to subdivision
+        if beams == 1:
+            t_step = SUBDIV_MAP['eighth']
+        elif beams == 2:
+            t_step = SUBDIV_MAP['16th']
+        else:
+            t_step = SUBDIV_MAP['32nd']
+        
+        onset = note_info['onset_q']
+        remaining = note_info['nominal_q']
+        
+        # Generate repeated notes
+        while remaining > 1e-9:
+            duration = min(t_step, remaining)
+            
+            played_note = PlayedNote(
+                hand=Hand.LEFT if note_info['staff'] == 2 else Hand.RIGHT,
+                pitch=note_info['midi'],
+                onset=onset,
+                duration=duration,
+                offset=onset + duration,
+                velocity=note_info['velocity'],
+                xml_element=note_info['xml'],
+                source_tag='tremolo',
+                voice=note_info['voice'],
+                staff=note_info['staff'],
+                measure_number=note_info['measure_number'],
+            )
+            self.played_notes.append(played_note)
+            
+            onset += duration
+            remaining -= duration
+    
+    def _expand_tremolo_two_notes(self, note_A_info: dict, note_B_info: dict):
+        """Expand two-note tremolo (alternating between two notes/chords)"""
+        # Determine subdivision from beams
+        beams = note_A_info.get('tremolo_beams', 2)
+        
+        # Map beams to subdivision
+        if beams == 1:
+            t_step = SUBDIV_MAP['eighth']
+        elif beams == 2:
+            t_step = SUBDIV_MAP['16th']
+        else:
+            t_step = SUBDIV_MAP['32nd']
+        
+        # Total duration is sum of both notes
+        total_duration = note_A_info['nominal_q'] + note_B_info['nominal_q']
+        
+        # Calculate number of steps
+        steps_count = int(total_duration / t_step) if t_step > 0 else 0
+        
+        # Starting onset
+        onset = note_A_info['onset_q']
+        
+        # Generate alternating sequence
+        for i in range(steps_count):
+            # Alternate between note A (even) and note B (odd)
+            if i % 2 == 0:
+                pitch = note_A_info['midi']
+                source_note = note_A_info
+            else:
+                pitch = note_B_info['midi']
+                source_note = note_B_info
+            
+            played_note = PlayedNote(
+                hand=Hand.LEFT if note_A_info['staff'] == 2 else Hand.RIGHT,
+                pitch=pitch,
+                onset=onset,
+                duration=t_step,
+                offset=onset + t_step,
+                velocity=note_A_info['velocity'],
+                xml_element=note_A_info['xml'],  # Reference first note
+                source_tag='tremolo_two_notes',
+                voice=note_A_info['voice'],
+                staff=note_A_info['staff'],
+                measure_number=note_A_info['measure_number'],
+            )
+            self.played_notes.append(played_note)
+            
+            onset += t_step
+    
+    def _resolve_glissandos(self, part_id: int, measure_notes: List[dict]):
+        """Resolve glissando start notes by finding their target notes"""
+        glissando_start = self.buffers.get(('glissando_buffer', part_id))
+        
+        if glissando_start is None:
+            return
+        
+        # Find target note (same voice/staff with glissando stop)
+        target_note = None
+        start_idx = -1
+        
+        # Find start note index
+        for idx, note in enumerate(measure_notes):
+            if note is glissando_start:
+                start_idx = idx
+                break
+        
+        # Search for stop note
+        if start_idx >= 0:
+            for idx in range(start_idx + 1, len(measure_notes)):
+                candidate = measure_notes[idx]
+                if (candidate['voice'] == glissando_start['voice'] and
+                    candidate['staff'] == glissando_start['staff'] and
+                    candidate['is_glissando_stop']):
+                    target_note = candidate
+                    break
+        
+        if target_note:
+            # Expand glissando
+            self._expand_glissando(glissando_start, target_note)
+        else:
+            # Fallback: treat as simple note
+            self._process_single_note(glissando_start, part_id)
+        
+        # Clear buffer
+        self.buffers[('glissando_buffer', part_id)] = None
+    
+    def _expand_glissando(self, note_start_info: dict, note_end_info: dict):
+        """Expand glissando into chromatic sequence from start to end pitch"""
+        pitch_start = note_start_info['midi']
+        pitch_end = note_end_info['midi']
+        
+        if pitch_start is None or pitch_end is None:
+            # Fallback: play as simple notes
+            self._append_simple_note(note_start_info)
+            return
+        
+        # Generate chromatic pitch sequence
+        if pitch_start <= pitch_end:
+            pitches = list(range(pitch_start, pitch_end + 1))
+        else:
+            pitches = list(range(pitch_start, pitch_end - 1, -1))
+        
+        # Total duration is the start note's duration
+        total_duration = note_start_info['nominal_q']
+        num_pitches = len(pitches)
+        
+        if num_pitches == 0:
+            return
+        
+        # Duration per chromatic step
+        t_step = max(GLISSANDO_MIN_NOTE_DURATION, total_duration / num_pitches)
+        
+        # Generate note sequence
+        onset = note_start_info['onset_q']
+        
+        for pitch in pitches:
+            played_note = PlayedNote(
+                hand=Hand.LEFT if note_start_info['staff'] == 2 else Hand.RIGHT,
+                pitch=pitch,
+                onset=onset,
+                duration=t_step,
+                offset=onset + t_step,
+                velocity=note_start_info['velocity'],
+                xml_element=note_start_info['xml'],  # Reference start note
+                source_tag='glissando',
+                voice=note_start_info['voice'],
+                staff=note_start_info['staff'],
+                measure_number=note_start_info['measure_number'],
+            )
+            self.played_notes.append(played_note)
+            
+            onset += t_step
+    
+    def _expand_ornament(self, note_info: dict):
+        """Expand ornaments (trills, mordents, turns) into note sequences"""
+        # Map MusicXML ornament names to our motif keys
+        ornament_map = {
+            'trill-mark': 'Trill',
+            'trill': 'Trill',
+            'mordent': 'Mordent',
+            'inverted-mordent': 'UpperMordent',
+            'turn': 'Turn',
+            'inverted-turn': 'InvertedTurn',
+        }
+        
+        # Find first supported ornament
+        motif_key = None
+        for orn in note_info['ornaments']:
+            motif_key = ornament_map.get(orn)
+            if motif_key and motif_key in ORNAMENT_MOTIFS:
+                break
+        
+        if not motif_key:
+            # No supported ornament, play as simple note
+            self._append_simple_note(note_info)
+            return
+        
+        prefix, body, suffix = ORNAMENT_MOTIFS[motif_key]
+        
+        # Calculate subdivision based on tempo
+        bps = bpm_to_bps(note_info['tempo'])
+        
+        if motif_key in ('Trill',):
+            if bps < 1.8:
+                t_sub = SUBDIV_MAP['32nd'] / 10.0
+            elif bps < 3.0:
+                t_sub = SUBDIV_MAP['32nd']
+            else:
+                t_sub = SUBDIV_MAP['16th']
+        else:
+            if bps < 1.8:
+                t_sub = SUBDIV_MAP['32nd']
+            elif bps < 3.0:
+                t_sub = SUBDIV_MAP['16th']
+            else:
+                t_sub = SUBDIV_MAP['eighth']
+        
+        # Calculate lengths
+        prefix_len = len(prefix) * t_sub
+        suffix_len = len(suffix) * t_sub
+        nominal = note_info['nominal_q']
+        remaining = max(0.0, nominal - prefix_len - suffix_len)
+        
+        body_unit_len = len(body) * t_sub if body else 0.0
+        reps = int(remaining / body_unit_len) if body_unit_len > 0 else 0
+        
+        # Helper to get MIDI for diatonic offset
+        def midi_for_offset(offset: int) -> Optional[int]:
+            return get_diatonic_neighbor(
+                note_info['step'],
+                note_info['octave'],
+                offset,
+                note_info['accmap_snapshot'],
+                note_info['keysig_map']
+            )
+        
+        # Build note sequence
+        sequence = []
+        for off in prefix:
+            sequence.append((midi_for_offset(off), t_sub))
+        for _ in range(reps):
+            for off in body:
+                sequence.append((midi_for_offset(off), t_sub))
+        for off in suffix:
+            sequence.append((midi_for_offset(off), t_sub))
+        
+        # Generate ornament notes
+        onset = note_info['onset_q']
+        used_total = 0.0
+        
+        for midi, duration in sequence:
+            if duration <= 0:
+                continue
+            
+            played_note = PlayedNote(
+                hand=Hand.LEFT if note_info['staff'] == 2 else Hand.RIGHT,
+                pitch=midi,
+                onset=onset,
+                duration=duration,
+                offset=onset + duration,
+                velocity=note_info['velocity'],
+                xml_element=note_info['xml'],
+                source_tag=f'ornament:{motif_key}',
+                voice=note_info['voice'],
+                staff=note_info['staff'],
+                measure_number=note_info['measure_number'],
+                extra={'ornament': motif_key}
+            )
+            self.played_notes.append(played_note)
+            onset += duration
+            used_total += duration
+        
+        # Append shortened principal note
+        remaining_main = max(0.0001, nominal - used_total)
+        principal = PlayedNote(
+            hand=Hand.LEFT if note_info['staff'] == 2 else Hand.RIGHT,
+            pitch=note_info['midi'],
+            onset=note_info['onset_q'] + used_total,
+            duration=remaining_main,
+            offset=note_info['onset_q'] + used_total + remaining_main,
+            velocity=note_info['velocity'],
+            xml_element=note_info['xml'],
+            source_tag='note_after_ornament',
+            voice=note_info['voice'],
+            staff=note_info['staff'],
+            measure_number=note_info['measure_number'],
+        )
+        self.played_notes.append(principal)
+    
+    def _resolve_ties(self):
+        """Merge tied notes into single sustained notes"""
+        # Group notes by signature
+        sig_groups = defaultdict(list)
+        for note in self.played_notes:
+            if note.xml_element is not None:
+                sig = (note.voice, note.staff, note.pitch)
+                sig_groups[sig].append((note, note.xml_element))
+        
+        merged = []
+        consumed = set()
+        
+        for sig, group in sig_groups.items():
+            group.sort(key=lambda x: x[0].onset)
+            i = 0
+            while i < len(group):
+                note, xml = group[i]
+                
+                if id(note) in consumed:
+                    i += 1
+                    continue
+                
+                # Check for tie start
+                ties = [t.get('type') for t in xml.findall('tie')]
+                if 'start' not in ties:
+                    merged.append(note)
+                    consumed.add(id(note))
+                    i += 1
+                    continue
+                
+                # Build tie chain
+                total_duration = note.duration
+                j = i + 1
+                while j < len(group):
+                    next_note, next_xml = group[j]
+                    next_ties = [t.get('type') for t in next_xml.findall('tie')]
+                    
+                    total_duration += next_note.duration
+                    consumed.add(id(next_note))
+                    
+                    if 'stop' in next_ties:
+                        j += 1
+                        break
+                    j += 1
+                
+                # Create merged note
+                merged_note = PlayedNote(
+                    hand=note.hand,
+                    pitch=note.pitch,
+                    onset=note.onset,
+                    duration=total_duration,
+                    offset=note.onset + total_duration,
+                    velocity=note.velocity,
+                    xml_element=note.xml_element,
+                    source_tag='tied_note',
+                    voice=note.voice,
+                    staff=note.staff,
+                    measure_number=note.measure_number,
+                )
+                merged.append(merged_note)
+                consumed.add(id(note))
+                i = j
+        
+        # Add non-tied notes
+        for note in self.played_notes:
+            if id(note) not in consumed:
+                merged.append(note)
+        
+        self.played_notes = merged
 
-# ------------------------------
-# Fingering integration point
-# ------------------------------
-def apply_fingering_algorithm(play_notes:List[PlayedNote], fingering_fn:Callable[[List[PlayedNote]],List[PlayedNote]]):
-    """
-    fingering_fn : function that receives list of PlayedNote for ONE hand at a time,
-                   returns same list with .finger set (1..5 integers).
-    We'll group by hand and call fingering_fn independently (your algorithm requirement).
-    """
-    # group by hand
+# ============================================================================
+# Fingering Integration
+# ============================================================================
+
+def apply_fingering(
+    notes: List[PlayedNote],
+    algorithm: Callable[[List[PlayedNote]], List[PlayedNote]]
+) -> List[PlayedNote]:
+    """Apply fingering algorithm to notes"""
     by_hand = defaultdict(list)
-    for pn in play_notes:
-        by_hand[pn.hand].append(pn)
-    for hand, notes in by_hand.items():
-        # ensure sorted by onset then pitch
-        notes_sorted = sorted(notes, key=lambda x:(x.onset, -x.pitch))
-        # call user algorithm
-        res = fingering_fn(notes_sorted)
-        # copy finger values back to master list (match by id: onset+pitch)
-        # we assume returned list items correspond 1:1 to input notes_sorted
-        for in_note, out_note in zip(notes_sorted, res):
-            in_note.finger = out_note.finger
+    for note in notes:
+        by_hand[note.hand].append(note)
+    
+    for hand, hand_notes in by_hand.items():
+        hand_notes.sort(key=lambda x: (x.onset, -(x.pitch or -999)))
+        fingered = algorithm(hand_notes)
+        
+        for original, fingered_note in zip(hand_notes, fingered):
+            original.finger = fingered_note.finger
+    
+    return notes
 
-# ------------------------------
-# Inject fingerings into XML
-# ------------------------------
-def inject_fingerings_to_xml(tree:etree._ElementTree, played_notes:List[PlayedNote], output_path:str):
-    """
-    For each PlayedNote that has xml_element not None, write <notations><technical><fingering>value</fingering></technical></notations>
-    If multiple PlayedNotes map to same xml element (e.g. chord members), we write the finger of the first occurrence.
-    """
-    written = set()
-    for pn in played_notes:
-        elem = pn.xml_element
-        if elem is None or pn.finger is None:
+def inject_fingerings(
+    tree: etree._ElementTree,
+    notes: List[PlayedNote],
+    output_path: str
+):
+    """Inject fingering numbers into MusicXML"""
+    processed = set()
+    
+    for note in notes:
+        if note.xml_element is None or note.finger is None:
             continue
-        elem_id = id(elem)
-        if elem_id in written:
+        
+        elem_id = id(note.xml_element)
+        if elem_id in processed:
             continue
-        # find or create notations/technical/fingering
-        notations = elem.find('notations')
+        
+        notations = note.xml_element.find('notations')
         if notations is None:
-            notations = etree.SubElement(elem, 'notations')
+            notations = etree.SubElement(note.xml_element, 'notations')
+        
         technical = notations.find('technical')
         if technical is None:
             technical = etree.SubElement(notations, 'technical')
-        fing = technical.find('fingering')
-        if fing is None:
-            fing = etree.SubElement(technical, 'fingering')
-        fing.text = str(pn.finger)
-        written.add(elem_id)
-    # write file
-    tree.write(output_path, pretty_print=True, xml_declaration=True, encoding='UTF-8')
+        
+        fingering = technical.find('fingering')
+        if fingering is None:
+            fingering = etree.SubElement(technical, 'fingering')
+        
+        fingering.text = str(note.finger)
+        processed.add(elem_id)
+    
+    tree.write(
+        output_path,
+        pretty_print=True,
+        xml_declaration=True,
+        encoding='UTF-8'
+    )
 
-# ------------------------------
-# Example dummy fingering algorithm (must be replaced by your actual algorithm)
-# ------------------------------
-def dummy_fingering_algorithm(notes:List[PlayedNote]) -> List[PlayedNote]:
-    # naive: assign fingers cycling 1..5
-    i=0
-    for n in notes:
-        n.finger = (i % 5) + 1
-        i += 1
+# ============================================================================
+# Example Fingering Algorithm
+# ============================================================================
+
+def simple_fingering_algorithm(notes: List[PlayedNote]) -> List[PlayedNote]:
+    """Simple cycling fingering algorithm (stub)"""
+    for i, note in enumerate(notes):
+        note.finger = (i % 5) + 1
     return notes
 
-# ------------------------------
-# Runner / API
-# ------------------------------
-def process_file(input_path:str, output_path:str, fingering_fn:Callable[[List[PlayedNote]],List[PlayedNote]]):
-    parser = PianistMusicXMLParser(input_path)
-    played = parser.parse_and_expand()
-    # Call fingering per hand
-    apply_fingering_algorithm(played, fingering_fn)
-    # inject into XML and write
-    inject_fingerings_to_xml(parser.tree, played, output_path)
-    return played
+# ============================================================================
+# Main Entry Point
+# ============================================================================
 
-# ------------------------------
-# CLI usage example
-# ------------------------------
+def process_musicxml(
+    input_path: str,
+    output_path: str,
+    fingering_algorithm: Callable = simple_fingering_algorithm
+) -> List[PlayedNote]:
+    """Process MusicXML file with fingering"""
+    parser = MusicXMLParser(input_path)
+    notes = parser.parse()
+    notes = apply_fingering(notes, fingering_algorithm)
+    inject_fingerings(parser.tree, notes, output_path)
+    return notes
+
 if __name__ == '__main__':
     if len(sys.argv) < 3:
-        print("Usage: python musicxml_pianist_parser.py input.xml output.xml")
+        print("Usage: python musicxml_pianist_improved.py input.xml output.xml")
         sys.exit(1)
-    inp = sys.argv[1]; outp = sys.argv[2]
-    played = process_file(inp, outp, dummy_fingering_algorithm)
-    print(f"Processed {len(played)} played notes. Output written to {outp}")
+    
+    input_file = sys.argv[1]
+    output_file = sys.argv[2]
+    
+    played_notes = process_musicxml(input_file, output_file)
+    print(f"✓ Generated {len(played_notes)} PlayedNote events")
+    print(f"✓ Output written to {output_file}")

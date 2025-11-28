@@ -134,24 +134,29 @@ def load_pig_file(filepath: str) -> np.ndarray:
 def apply_time_dep_pitch_order(notes: np.ndarray, time_threshold: float = 0.03) -> np.ndarray:
     """
     Replicates the C++ `TimeDepPitchOrder` logic exactly.
+    Groups notes by onset (within 0.03s tolerance) and sorts them by Pitch DESCENDING (High to Low).
     """
     if len(notes) == 0:
         return notes
 
+    # On s'assure que les notes sont triées par temps d'abord pour le clustering
+    notes = np.sort(notes, order=['ontime'])
+    
     reordered_notes = []
 
     i = 0
     while i < len(notes):
         cluster_indices = [i]
         j = i + 1
-        # Corrected logic: compare with previous note in the original sequence
+        # Logic de clustering C++ : on continue tant que l'écart avec la note PRÉCÉDENTE est faible
         while j < len(notes) and abs(notes[j]['ontime'] - notes[j-1]['ontime']) < time_threshold:
             cluster_indices.append(j)
             j += 1
 
         cluster_notes = notes[cluster_indices]
-        # C++ sorts by -pitch descending, which is pitch ascending.
+        
         sorted_indices = np.argsort(cluster_notes['pitch'], kind='stable')
+        
         reordered_notes.extend(cluster_notes[sorted_indices])
         i = j
 

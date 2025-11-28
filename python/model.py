@@ -35,7 +35,9 @@ class HMMParameters:
         self._parse_file()
 
     def _log(self, arr):
-        return np.log(arr + self.log_eps)
+        # Ignore the "divide by zero" warning because it is intentional
+        with np.errstate(divide='ignore'):
+            return np.log(arr)
 
     def _normalize_and_log(self, arr):
         s = np.sum(arr)

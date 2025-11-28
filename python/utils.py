@@ -139,8 +139,9 @@ def apply_time_dep_pitch_order(notes: np.ndarray, time_threshold: float = 0.03) 
     if len(notes) == 0:
         return notes
 
-    # On s'assure que les notes sont triées par temps d'abord pour le clustering
-    notes = np.sort(notes, order=['ontime'])
+    # The C++ implementation processes notes linearly. A stable sort on ontime
+    # preserves the original file order for notes with identical timestamps.
+    notes = np.sort(notes, order=['ontime'], kind='stable')
     
     reordered_notes = []
 
@@ -155,7 +156,8 @@ def apply_time_dep_pitch_order(notes: np.ndarray, time_threshold: float = 0.03) 
 
         cluster_notes = notes[cluster_indices]
         
-        sorted_indices = np.argsort(cluster_notes['pitch'], kind='stable')
+        # C++ sorts in DESCENDING order of pitch (by negating the pitch and sorting ascending)
+        sorted_indices = np.argsort(-cluster_notes['pitch'], kind='stable')
         
         reordered_notes.extend(cluster_notes[sorted_indices])
         i = j

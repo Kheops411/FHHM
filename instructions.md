@@ -579,3 +579,151 @@ The test passes if the code runs without error and produces a chosen path where 
 1.  `soft_position_hmm/inference.py`
 2.  `tests/test_milestone_3.py`
 3.  Console output showing the "Best Anchor" selected by the algorithm for the test sequence.
+
+
+# Developer Instructions: Milestone 4 - Backtracking & EM Training
+
+## Project Context
+The forward pass is complete. We now know the probability of the best path, but not the path itself.
+We need to:
+1.  **Backtrack:** Reconstruct the sequence of fingers and anchors.
+2.  **Train:** Use the "Expectation-Maximization" loop to refine the RBF hand shapes using real data.
+
+## 1. File Structure
+Create `soft_position_hmm/training.py`.
+
+## 2. Implementation: Backtracking (inference.py)
+
+First, add the backtracking function to `inference.py`.
+
+```python
+@nb.njit(cache=True)
+def backtracking(
+    n_obs: int,
+    lattice_log_probs: np.ndarray,
+    lattice_backpointers: np.ndarray
+):
+    """
+    Reconstructs the optimal path from the filled lattice.
+    Returns: (fingers, anchors) arrays.
+    """
+    # 1. Find the best ending state at t = n_obs - 1
+    # We need to find indices (f_prev, f_curr, k_curr) that maximize log_probs[-1]
+
+    # ... Implementation ...
+
+    # 2. Iterate backwards from t = n_obs - 1 down to 0
+    # Use the lattice_backpointers to jump to the previous state.
+
+    # Return two arrays:
+    #   opt_fingers (int32 array of shape n_obs)
+    #   opt_anchors (int32 array of shape n_obs, storing INDICES of anchors)
+```
+
+**Developer Note:**
+*   Remember that `lattice_log_probs` has shape `(T, 5, 5, 9)`. You need to find the `argmax` over the last 3 dimensions.
+*   The backpointer at `t` gives you the indices for `t-1`.
+
+## 3. Implementation: The EM Trainer (`training.py`)
+
+This class manages the dataset iteration and parameter updates.
+
+### Step 3.1: The `SoftPositionTrainer` Class
+
+```python
+import numpy as np
+from .core import SoftPositionModel, ANCHORS
+from .structural import ViterbiLattice, N_FINGERS, N_ANCHORS
+from .inference import run_forward_pass, backtracking
+from .utils import load_pig_file, apply_time_dep_pitch_order, filter_notes_by_hand
+
+class SoftPositionTrainer:
+    def __init__(self):
+        self.model = SoftPositionModel()
+        # Initialize Agility Matrix (Transitions) separately
+        # (Start with uniform probabilities or load from old HMM if available,
+        # for M4 we will init with zeros log-prob).
+        self.agility_matrix = np.zeros((5, 5, 5), dtype=np.float64)
+
+    def train(self, file_paths: list, n_iterations: int = 5):
+        """
+        Runs the EM loop.
+        """
+        for it in range(n_iterations):
+            print(f"--- Iteration {it + 1}/{n_iterations} ---")
+
+            total_log_likelihood = 0.0
+
+            # Accumulators for the M-Step
+            # We need to collect observed delta_pitches for each finger to update RBFs
+            # Structure: List of lists, or large arrays.
+            # finger_deltas[finger_idx] -> [delta1, delta2, ...]
+            finger_deltas = [[] for _ in range(N_FINGERS)]
+
+            for fpath in file_paths:
+                # 1. Load Data
+                # ... (Use utils to load and filter for Right Hand only for now) ...
+
+                # 2. E-Step: Guess the Anchors
+                # We know the TRUE fingers from the PIG file.
+                # We need to run a "Constrained Viterbi":
+                # Only explore states where f_curr == true_finger.
+
+                # ... (See logic detailed below) ...
+
+                # 3. Collect Statistics
+                # Once we have the path of anchors, we calculate:
+                # delta = note_pitch - ANCHOR_VALUE[opt_anchor]
+                # Store this delta in the list for the corresponding finger.
+
+            # 4. M-Step: Update Parameters
+            self._update_parameters(finger_deltas)
+
+            print(f"Total Log Likelihood: {total_log_likelihood}")
+
+    def _update_parameters(self, finger_deltas):
+        """
+        Re-estimates the ideal_offset and width for each finger based on collected data.
+        """
+        # For each finger 0-4:
+        #   mu = mean(collected_deltas)
+        #   sigma = std(collected_deltas)
+        # Update self.model.rbf_mu and self.model.rbf_sigma
+        pass
+```
+
+### Step 3.2: The "Constrained Viterbi" Logic
+For the training to work, we cannot just run the normal Viterbi. We must force the algorithm to respect the **Ground Truth Fingers** provided in the dataset.
+
+**Modification needed in `inference.py`:**
+Create a new function `run_constrained_forward_pass`.
+It is identical to `run_forward_pass` EXCEPT:
+*   Add argument `true_fingers: np.ndarray`.
+*   Inside the loops `for f_curr ...`:
+    *   Add check: `if f_curr != true_fingers[t] - 1: continue` (Assuming 1-based indexing in PIG).
+    *   (Careful with indexing: PIG fingers are 1..5, array indices are 0..4).
+*   Inside the loops `for f_prev ...`:
+    *   Add check: `if f_prev != true_fingers[t-1] - 1: continue`.
+
+**Task:** Implement `run_constrained_forward_pass` in `inference.py`.
+
+## 4. Validation: `test_milestone_4.py`
+
+This test is crucial. It proves the model is learning.
+
+1.  **Synthetic Data Generation:**
+    Create a fake dataset (list of notes) where the thumb always plays notes that are far to the left relative to the "average" position, and the pinky plays notes far to the right.
+2.  **Run Trainer:**
+    Run `SoftPositionTrainer.train` on this fake data for 5 iterations.
+3.  **Check Convergence:**
+    *   Verify that `model.rbf_mu[0]` (Thumb) becomes negative.
+    *   Verify that `model.rbf_mu[4]` (Pinky) becomes positive.
+    *   Verify that `total_log_likelihood` increases (becomes less negative).
+
+**Deliverables for Milestone 4:**
+1.  `inference.py` (Added `backtracking` and `run_constrained_forward_pass`).
+2.  `training.py` (Full class).
+3.  `tests/test_milestone_4.py` (Proof of learning).
+
+**Critical Instruction:**
+For the M-Step (`_update_parameters`), do NOT update the `inertia` parameters yet. Only update `rbf_mu` and `rbf_sigma`. Updating inertia requires more complex math (gradient descent) which we will skip for this milestone. Focus on learning the Hand Shape.

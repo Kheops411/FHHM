@@ -12,8 +12,8 @@ from python import evaluate
 
 # --- Configuration des chemins ---
 SCORES_DIR = os.path.join('.', 'scores')
-PARAM_FILE_HMM2 = './param_FHMM2_new.txt'#os.path.join('.', 'cpp', 'Code', 'param_FHMM2.txt')
-PARAM_FILE_HMM3 = './param_FHMM3_new.txt'#os.path.join('.', 'cpp', 'Code', 'param_FHMM3.txt')
+PARAM_FILE_HMM2 = os.path.join('.', 'cpp', 'Code', 'param_FHMM2.txt')#'./param_FHMM2_new.txt'
+PARAM_FILE_HMM3 = os.path.join('.', 'cpp', 'Code', 'param_FHMM3.txt')#'./param_FHMM3_new.txt'
 
 def group_scores_by_piece(scores_dir):
     """

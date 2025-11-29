@@ -35,9 +35,7 @@ class HMMParameters:
         self._parse_file()
 
     def _log(self, arr):
-        # Ignore the "divide by zero" warning because it is intentional
-        with np.errstate(divide='ignore'):
-            return np.log(arr)
+        return np.log(arr + self.log_eps)
 
     def _normalize_and_log(self, arr):
         s = np.sum(arr)
@@ -314,7 +312,7 @@ def run_viterbi(notes: np.ndarray, params: HMMParameters, hand: int = 0) -> np.n
     w1_2 = 0.5
     w2_2 = 0.5
     
-    w1_3 = 0.667
+    w1_3 = 1./1.5#0.667
     w2_3 = 0.5
     w3_3 = 0.2
     

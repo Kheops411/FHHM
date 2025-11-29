@@ -1,6 +1,5 @@
-#!/usr/bin/env python3
 """
-musicxml_pianist_improved.py
+xml_parser.py
 
 Parse MusicXML => produce full "PlayedNote" timeline with comprehensive support for:
 - Structural navigation (repeats, endings, D.C./D.S./Coda/Segno/<sound>)
@@ -9,7 +8,7 @@ Parse MusicXML => produce full "PlayedNote" timeline with comprehensive support 
 - Preserves XML refs for fingering injection
 
 Dependencies: lxml
-Usage: python musicxml_pianist_improved.py input.xml output.xml
+Usage: python xml_parser.py input.xml output.xml
 """
 from lxml import etree
 from dataclasses import dataclass, field
@@ -95,7 +94,6 @@ class PlayedNote:
     duration: float  # Quarter note units
     offset: float  # onset + duration
     velocity: int
-    tempo: float = DEFAULT_TEMPO  # BPM at note's position
     xml_element: Optional[etree._Element] = None
     source_tag: str = 'note'
     voice: str = '1'
@@ -103,21 +101,6 @@ class PlayedNote:
     measure_number: int = 0
     finger: Optional[int] = None
     extra: dict = field(default_factory=dict)
-    
-    @property
-    def onset_seconds(self) -> float:
-        """Convert onset from quarters to seconds"""
-        return quarters_to_seconds(self.onset, self.tempo)
-    
-    @property
-    def duration_seconds(self) -> float:
-        """Convert duration from quarters to seconds"""
-        return quarters_to_seconds(self.duration, self.tempo)
-    
-    @property
-    def offset_seconds(self) -> float:
-        """Convert offset from quarters to seconds"""
-        return quarters_to_seconds(self.offset, self.tempo)
 
 @dataclass
 class PartState:
@@ -180,18 +163,6 @@ def ticks_to_quarters(ticks: int, divisions: int) -> float:
 def bpm_to_bps(bpm: float) -> float:
     """Convert beats per minute to beats per second"""
     return max(bpm, 1.0) / 60.0
-
-def quarters_to_seconds(quarters: float, tempo_bpm: float) -> float:
-    """Convert musical time (quarters) to absolute time (seconds)"""
-    if tempo_bpm <= 0:
-        tempo_bpm = DEFAULT_TEMPO
-    return quarters * (60.0 / tempo_bpm)
-
-def seconds_to_quarters(seconds: float, tempo_bpm: float) -> float:
-    """Convert absolute time (seconds) to musical time (quarters)"""
-    if tempo_bpm <= 0:
-        tempo_bpm = DEFAULT_TEMPO
-    return seconds * (tempo_bpm / 60.0)
 
 def safe_int(text: Optional[str], default: int = 0) -> int:
     """Safely parse integer from text"""
@@ -541,7 +512,6 @@ class MusicXMLParser:
         notations = note.find('notations')
         ornaments = self._get_ornaments(notations)
         articulations = self._get_articulations(note)
-        xml_fingering = self._get_xml_fingering(note)  # Extract ground truth
         
         # Detect tremolo type
         tremolo_node = notations.find('tremolo') if notations is not None else None
@@ -602,8 +572,7 @@ class MusicXMLParser:
             'keysig_map': dict(state.keysig_map),
             'velocity': velocity,
             'art_ratio': art_ratio,
-            'onset_ticks': onset_ticks,
-            'xml_fingering': xml_fingering,  # Ground truth fingering
+            'onset_ticks': onset_ticks
         }
         
         # Store for glissando resolution
@@ -700,36 +669,6 @@ class MusicXMLParser:
                     ornaments.append(etree.QName(orn.tag).localname)
         return ornaments
     
-    def _get_xml_fingering(self, note: etree._Element) -> Optional[int]:
-        """Extract fingering from XML technical notations (ground truth)"""
-        notations = note.find('notations')
-        if notations is not None:
-            technical = notations.find('technical')
-            if technical is not None:
-                fingering = technical.find('fingering')
-                if fingering is not None and fingering.text:
-                    try:
-                        # Handle simple cases: "1", "2", etc.
-                        # Handle substitutions: "1-2" → take last digit
-                        # Handle alternations: "5" or "4" → take first
-                        val_str = fingering.text.strip()
-                        
-                        # Remove common non-numeric characters
-                        val_str = val_str.replace('(', '').replace(')', '').strip()
-                        
-                        # If contains hyphen (substitution), take last
-                        if '-' in val_str:
-                            val_str = val_str.split('-')[-1].strip()
-                        
-                        # If contains spaces, take first
-                        if ' ' in val_str:
-                            val_str = val_str.split()[0].strip()
-                        
-                        return int(val_str)
-                    except (ValueError, IndexError):
-                        pass
-        return None
-    
     def _calculate_velocity(self, articulations: List[str]) -> int:
         """Calculate MIDI velocity based on articulations"""
         velocity = DEFAULT_VELOCITY
@@ -745,48 +684,27 @@ class MusicXMLParser:
                 return ARTICULATION_RATIOS[art]
         return 1.0
     
-    def _create_played_note(
-        self,
-        note_info: dict,
-        onset: float,
-        duration: float,
-        source_tag: str,
-        **kwargs
-    ) -> PlayedNote:
-        """Factory method to create PlayedNote with consistent parameters"""
-        # On s'assure que la durée n'est jamais nulle pour éviter des divisions par zéro plus tard
-        safe_duration = max(MIN_NOTE_DURATION, duration)
-        
-        return PlayedNote(
-            hand=Hand.LEFT if note_info['staff'] == 2 else Hand.RIGHT,
-            pitch=note_info.get('midi'),
-            onset=onset,
-            duration=safe_duration,
-            offset=onset + safe_duration,
-            velocity=note_info.get('velocity', DEFAULT_VELOCITY),
-            tempo=note_info.get('tempo', DEFAULT_TEMPO),
-            xml_element=note_info.get('xml'),
-            source_tag=source_tag,
-            voice=note_info.get('voice', '1'),
-            staff=note_info.get('staff', 1),
-            measure_number=note_info.get('measure_number', 0),
-            finger=note_info.get('xml_fingering'), # Ground Truth
-            extra=kwargs.get('extra', {})
-        )
-
     def _append_simple_note(self, note_info: dict):
         """Append a simple note to played_notes"""
-        # Calcul de la durée réelle basée sur l'articulation (staccato, etc.)
         duration = note_info['nominal_q'] * note_info['art_ratio']
+        if duration <= 0:
+            duration = 0.0001
         
-        # Utilisation de la Factory pour garantir la cohérence (Tempo, Finger, etc.)
-        played_note = self._create_played_note(
-            note_info, 
-            note_info['onset_q'], 
-            duration, 
-            'note'
+        played_note = PlayedNote(
+            hand=Hand.LEFT if note_info['staff'] == 2 else Hand.RIGHT,
+            pitch=note_info['midi'],
+            onset=note_info['onset_q'],
+            duration=duration,
+            offset=note_info['onset_q'] + duration,
+            velocity=note_info['velocity'],
+            xml_element=note_info['xml'],
+            source_tag='note',
+            voice=note_info['voice'],
+            staff=note_info['staff'],
+            measure_number=note_info['measure_number'],
         )
         self.played_notes.append(played_note)
+    
     def _capture_grace_note(
         self,
         note: etree._Element,
@@ -824,7 +742,6 @@ class MusicXMLParser:
             'grace_type': grace_type,
             'make_time': make_time,
             'velocity': DEFAULT_VELOCITY,
-            'xml_fingering': None
         }
     
     def _flush_graces_for_principal(
@@ -849,13 +766,20 @@ class MusicXMLParser:
         durations = []
         for grace in graces:
             if grace['grace_type'] == 'Acciaccatura':
+                # Very short
                 t = min(SUBDIV_MAP['32nd'] / 2.0, (0.5 * principal_duration) / max(1, n))
             else:
+                # Appoggiatura - steal from principal
                 is_dotted = principal_xml.find('dot') is not None
-                t = ((2.0 / 3.0) if is_dotted else 0.5) * principal_duration / max(1, n)
+                if is_dotted:
+                    t = (2.0 / 3.0) * principal_duration / max(1, n)
+                else:
+                    t = 0.5 * principal_duration / max(1, n)
             durations.append(t)
         
         total_shift = sum(durations)
+        
+        # Create grace note events
         grace_notes = []
         current_onset = principal_onset
         
@@ -869,23 +793,18 @@ class MusicXMLParser:
                     grace['keysig_map']
                 )
             
-            # Create grace note info for factory
-            grace_info = {
-                'staff': grace['staff'],
-                'midi': midi,
-                'velocity': grace['velocity'],
-                'tempo': DEFAULT_TEMPO,  # Graces typically follow context tempo
-                'xml': grace['xml'],
-                'voice': grace['voice'],
-                'measure_number': grace['measure_number'],
-                'xml_fingering': None,  # Graces typically don't have fingerings
-            }
-            
-            played_note = self._create_played_note(
-                grace_info,
-                current_onset,
-                duration,
-                f"grace:{grace['grace_type']}"
+            played_note = PlayedNote(
+                hand=Hand.LEFT if grace['staff'] == 2 else Hand.RIGHT,
+                pitch=midi,
+                onset=current_onset,
+                duration=duration,
+                offset=current_onset + duration,
+                velocity=grace['velocity'],
+                xml_element=grace['xml'],
+                source_tag=f"grace:{grace['grace_type']}",
+                voice=grace['voice'],
+                staff=grace['staff'],
+                measure_number=grace['measure_number'],
             )
             grace_notes.append(played_note)
             current_onset += duration
@@ -961,99 +880,192 @@ class MusicXMLParser:
             return
         
         N = len(members)
+        
+        # Get nominal duration (maximum of all notes in group)
         nominal = max(m['nominal_q'] for m in members)
         
         # Sort by MIDI pitch (ascending, grave to aigu)
         member_list = [(m['midi'] or 0, m) for m in members]
         member_list.sort(key=lambda x: x[0])
         
-        # Detect direction
-        is_descending = any(
-            m['xml'].find('.//arpeggiate') is not None and
-            'down' in m['xml'].find('.//arpeggiate').get('direction', '').lower()
-            for m in members
-        )
+        # Detect direction (check if ANY note has direction="down")
+        is_descending = False
+        for m in members:
+            arp_node = m['xml'].find('.//arpeggiate')
+            if arp_node is not None:
+                direction = arp_node.get('direction', '').lower()
+                if 'down' in direction:
+                    is_descending = True
+                    break
         
+        # Apply direction: reverse if descending
         if is_descending:
             member_list = list(reversed(member_list))
         
         # Calculate timing
         tempo_bpm = state.tempo
+        
+        # Convert max offset from milliseconds to quarters based on tempo
+        # MaxOffsetQuarters = 0.06 * (TempoBPM / 60.0)
         max_offset_quarters = (ARPEGGIO_MAX_OFFSET_MS / 1000.0) * (tempo_bpm / 60.0)
+        
+        # Raw step: divide total duration by number of notes
         raw_step = nominal / N if N > 0 else 0.0
+        
+        # Actual offset step: minimum of raw step and max offset
         offset_step = min(raw_step, max_offset_quarters)
         
+        # Base onset
         base_onset = members[0]['onset_q']
         
-        # Generate events
+        # Generate events with staggered onsets
         for i, (midi, note_info) in enumerate(member_list):
+            # Calculate delay for this note
             delay = offset_step * i * ARPEGGIO_DEFAULT_STRETCH
+            
+            # Real onset = base + delay
             real_onset = base_onset + delay
+            
+            # Real duration = original nominal - delay (time compression)
+            # The note must end at the same absolute time as if not arpeggiated
             real_duration = max(MIN_NOTE_DURATION, nominal - delay)
             
-            played_note = self._create_played_note(
-                note_info,
-                real_onset,
-                real_duration,
-                'arpeggio_note',
+            played_note = PlayedNote(
+                hand=Hand.LEFT if note_info['staff'] == 2 else Hand.RIGHT,
+                pitch=midi,
+                onset=real_onset,
+                duration=real_duration,
+                offset=real_onset + real_duration,
+                velocity=note_info['velocity'],
+                xml_element=note_info['xml'],
+                source_tag='arpeggio_note',
+                voice=note_info['voice'],
+                staff=note_info['staff'],
+                measure_number=note_info['measure_number'],
                 extra={'arpeggio_size': N, 'arpeggio_index': i, 'arpeggio_delay': delay}
             )
             self.played_notes.append(played_note)
     
     def _expand_chord_group(self, members: List[dict], state: PartState, arpeggio: bool = True):
-        """Expand a regular chord group (non-arpeggiated)"""
+        """Expand a regular chord group (non-arpeggiated, deprecated)"""
+        # This method is kept for backward compatibility but should not be used for arpeggios
         if not members:
             return
         
         nominal = max(m['nominal_q'] for m in members)
         N = len(members)
+        
+        # Sort by pitch
         member_list = [(m['midi'] or 0, m) for m in members]
         member_list.sort(key=lambda x: x[0])
+        
         base_onset = members[0]['onset_q']
         
+        # Regular chord: all notes start simultaneously
         for i, (midi, note_info) in enumerate(member_list):
-            played_note = self._create_played_note(
-                note_info,
-                base_onset,
-                nominal,
-                'chord_note',
+            played_note = PlayedNote(
+                hand=Hand.LEFT if note_info['staff'] == 2 else Hand.RIGHT,
+                pitch=midi,
+                onset=base_onset,
+                duration=nominal,
+                offset=base_onset + nominal,
+                velocity=note_info['velocity'],
+                xml_element=note_info['xml'],
+                source_tag='chord_note',
+                voice=note_info['voice'],
+                staff=note_info['staff'],
+                measure_number=note_info['measure_number'],
                 extra={'chord_size': N, 'chord_index': i}
             )
             self.played_notes.append(played_note)
     
     def _expand_tremolo(self, note_info: dict):
         """Expand tremolo into rapid repeated notes"""
+        tremolo_node = note_info['xml'].find('.//tremolo')
+        
+        # Determine subdivision from beams/slashes
         beams = note_info.get('tremolo_beams', 2)
-        t_step = {1: SUBDIV_MAP['eighth'], 2: SUBDIV_MAP['16th']}.get(beams, SUBDIV_MAP['32nd'])
+        
+        # Map beams to subdivision
+        if beams == 1:
+            t_step = SUBDIV_MAP['eighth']
+        elif beams == 2:
+            t_step = SUBDIV_MAP['16th']
+        else:
+            t_step = SUBDIV_MAP['32nd']
         
         onset = note_info['onset_q']
         remaining = note_info['nominal_q']
         
+        # Generate repeated notes
         while remaining > 1e-9:
             duration = min(t_step, remaining)
-            played_note = self._create_played_note(note_info, onset, duration, 'tremolo')
+            
+            played_note = PlayedNote(
+                hand=Hand.LEFT if note_info['staff'] == 2 else Hand.RIGHT,
+                pitch=note_info['midi'],
+                onset=onset,
+                duration=duration,
+                offset=onset + duration,
+                velocity=note_info['velocity'],
+                xml_element=note_info['xml'],
+                source_tag='tremolo',
+                voice=note_info['voice'],
+                staff=note_info['staff'],
+                measure_number=note_info['measure_number'],
+            )
             self.played_notes.append(played_note)
+            
             onset += duration
             remaining -= duration
     
     def _expand_tremolo_two_notes(self, note_A_info: dict, note_B_info: dict):
         """Expand two-note tremolo (alternating between two notes/chords)"""
+        # Determine subdivision from beams
         beams = note_A_info.get('tremolo_beams', 2)
-        t_step = {1: SUBDIV_MAP['eighth'], 2: SUBDIV_MAP['16th']}.get(beams, SUBDIV_MAP['32nd'])
         
+        # Map beams to subdivision
+        if beams == 1:
+            t_step = SUBDIV_MAP['eighth']
+        elif beams == 2:
+            t_step = SUBDIV_MAP['16th']
+        else:
+            t_step = SUBDIV_MAP['32nd']
+        
+        # Total duration is sum of both notes
         total_duration = note_A_info['nominal_q'] + note_B_info['nominal_q']
+        
+        # Calculate number of steps
         steps_count = int(total_duration / t_step) if t_step > 0 else 0
+        
+        # Starting onset
         onset = note_A_info['onset_q']
         
+        # Generate alternating sequence
         for i in range(steps_count):
-            source_note = note_A_info if i % 2 == 0 else note_B_info
-            played_note = self._create_played_note(
-                {**note_A_info, 'midi': source_note['midi']},
-                onset,
-                t_step,
-                'tremolo_two_notes'
+            # Alternate between note A (even) and note B (odd)
+            if i % 2 == 0:
+                pitch = note_A_info['midi']
+                source_note = note_A_info
+            else:
+                pitch = note_B_info['midi']
+                source_note = note_B_info
+            
+            played_note = PlayedNote(
+                hand=Hand.LEFT if note_A_info['staff'] == 2 else Hand.RIGHT,
+                pitch=pitch,
+                onset=onset,
+                duration=t_step,
+                offset=onset + t_step,
+                velocity=note_A_info['velocity'],
+                xml_element=note_A_info['xml'],  # Reference first note
+                source_tag='tremolo_two_notes',
+                voice=note_A_info['voice'],
+                staff=note_A_info['staff'],
+                measure_number=note_A_info['measure_number'],
             )
             self.played_notes.append(played_note)
+            
             onset += t_step
     
     def _resolve_glissandos(self, part_id: int, measure_notes: List[dict]):
@@ -1099,53 +1111,82 @@ class MusicXMLParser:
         pitch_end = note_end_info['midi']
         
         if pitch_start is None or pitch_end is None:
+            # Fallback: play as simple notes
             self._append_simple_note(note_start_info)
             return
         
         # Generate chromatic pitch sequence
-        pitches = (list(range(pitch_start, pitch_end + 1)) if pitch_start <= pitch_end
-                   else list(range(pitch_start, pitch_end - 1, -1)))
+        if pitch_start <= pitch_end:
+            pitches = list(range(pitch_start, pitch_end + 1))
+        else:
+            pitches = list(range(pitch_start, pitch_end - 1, -1))
         
-        if not pitches:
+        # Total duration is the start note's duration
+        total_duration = note_start_info['nominal_q']
+        num_pitches = len(pitches)
+        
+        if num_pitches == 0:
             return
         
-        total_duration = note_start_info['nominal_q']
-        t_step = max(GLISSANDO_MIN_NOTE_DURATION, total_duration / len(pitches))
+        # Duration per chromatic step
+        t_step = max(GLISSANDO_MIN_NOTE_DURATION, total_duration / num_pitches)
+        
+        # Generate note sequence
         onset = note_start_info['onset_q']
         
         for pitch in pitches:
-            played_note = self._create_played_note(
-                {**note_start_info, 'midi': pitch},
-                onset,
-                t_step,
-                'glissando'
+            played_note = PlayedNote(
+                hand=Hand.LEFT if note_start_info['staff'] == 2 else Hand.RIGHT,
+                pitch=pitch,
+                onset=onset,
+                duration=t_step,
+                offset=onset + t_step,
+                velocity=note_start_info['velocity'],
+                xml_element=note_start_info['xml'],  # Reference start note
+                source_tag='glissando',
+                voice=note_start_info['voice'],
+                staff=note_start_info['staff'],
+                measure_number=note_start_info['measure_number'],
             )
             self.played_notes.append(played_note)
+            
             onset += t_step
     
     def _expand_ornament(self, note_info: dict):
         """Expand ornaments (trills, mordents, turns) into note sequences"""
+        # Map MusicXML ornament names to our motif keys
         ornament_map = {
-            'trill-mark': 'Trill', 'trill': 'Trill', 'mordent': 'Mordent',
-            'inverted-mordent': 'UpperMordent', 'turn': 'Turn', 'inverted-turn': 'InvertedTurn',
+            'trill-mark': 'Trill',
+            'trill': 'Trill',
+            'mordent': 'Mordent',
+            'inverted-mordent': 'UpperMordent',
+            'turn': 'Turn',
+            'inverted-turn': 'InvertedTurn',
         }
         
-        motif_key = next((ornament_map.get(orn) for orn in note_info['ornaments']
-                         if ornament_map.get(orn) in ORNAMENT_MOTIFS), None)
+        # Find first supported ornament
+        motif_key = None
+        for orn in note_info['ornaments']:
+            motif_key = ornament_map.get(orn)
+            if motif_key and motif_key in ORNAMENT_MOTIFS:
+                break
         
         if not motif_key:
+            # No supported ornament, play as simple note
             self._append_simple_note(note_info)
             return
         
         prefix, body, suffix = ORNAMENT_MOTIFS[motif_key]
+        
+        # Calculate subdivision based on tempo
         bps = bpm_to_bps(note_info['tempo'])
         
-        if motif_key == 'Trill':
-            if bps < 1.8: # Lent
-                t_sub = SUBDIV_MAP['32nd'] / 10.0 # Trille très rapide
-            elif bps < 3.0: # Moyen
+        if motif_key in ('Trill',):
+            if bps < 1.8:
+                t_sub = SUBDIV_MAP['32nd'] / 10.0
+            elif bps < 3.0:
                 t_sub = SUBDIV_MAP['32nd']
-            else: # Rapide
+            else:
                 t_sub = SUBDIV_MAP['16th']
         else:
             if bps < 1.8:
@@ -1160,42 +1201,73 @@ class MusicXMLParser:
         suffix_len = len(suffix) * t_sub
         nominal = note_info['nominal_q']
         remaining = max(0.0, nominal - prefix_len - suffix_len)
+        
         body_unit_len = len(body) * t_sub if body else 0.0
         reps = int(remaining / body_unit_len) if body_unit_len > 0 else 0
         
+        # Helper to get MIDI for diatonic offset
         def midi_for_offset(offset: int) -> Optional[int]:
             return get_diatonic_neighbor(
-                note_info['step'], note_info['octave'], offset,
-                note_info['accmap_snapshot'], note_info['keysig_map']
+                note_info['step'],
+                note_info['octave'],
+                offset,
+                note_info['accmap_snapshot'],
+                note_info['keysig_map']
             )
         
-        # Build and generate sequence
-        sequence = [(midi_for_offset(off), t_sub) for off in prefix]
-        sequence.extend([(midi_for_offset(off), t_sub) for _ in range(reps) for off in body])
-        sequence.extend([(midi_for_offset(off), t_sub) for off in suffix])
+        # Build note sequence
+        sequence = []
+        for off in prefix:
+            sequence.append((midi_for_offset(off), t_sub))
+        for _ in range(reps):
+            for off in body:
+                sequence.append((midi_for_offset(off), t_sub))
+        for off in suffix:
+            sequence.append((midi_for_offset(off), t_sub))
         
+        # Generate ornament notes
         onset = note_info['onset_q']
         used_total = 0.0
         
         for midi, duration in sequence:
-            if duration > 0:
-                ornament_info = {**note_info, 'midi': midi, 'xml_fingering': None}
-                
-                played_note = self._create_played_note(
-                    ornament_info, onset, duration, f'ornament:{motif_key}',
-                    extra={'ornament': motif_key}
-                )
-                self.played_notes.append(played_note)
-                onset += duration
-                used_total += duration
+            if duration <= 0:
+                continue
+            
+            played_note = PlayedNote(
+                hand=Hand.LEFT if note_info['staff'] == 2 else Hand.RIGHT,
+                pitch=midi,
+                onset=onset,
+                duration=duration,
+                offset=onset + duration,
+                velocity=note_info['velocity'],
+                xml_element=note_info['xml'],
+                source_tag=f'ornament:{motif_key}',
+                voice=note_info['voice'],
+                staff=note_info['staff'],
+                measure_number=note_info['measure_number'],
+                extra={'ornament': motif_key}
+            )
+            self.played_notes.append(played_note)
+            onset += duration
+            used_total += duration
         
-        # Append shortened principal
-        remaining_main = max(MIN_NOTE_DURATION, nominal - used_total)
-        principal = self._create_played_note(
-            note_info, note_info['onset_q'] + used_total,
-            remaining_main, 'note_after_ornament'
+        # Append shortened principal note
+        remaining_main = max(0.0001, nominal - used_total)
+        principal = PlayedNote(
+            hand=Hand.LEFT if note_info['staff'] == 2 else Hand.RIGHT,
+            pitch=note_info['midi'],
+            onset=note_info['onset_q'] + used_total,
+            duration=remaining_main,
+            offset=note_info['onset_q'] + used_total + remaining_main,
+            velocity=note_info['velocity'],
+            xml_element=note_info['xml'],
+            source_tag='note_after_ornament',
+            voice=note_info['voice'],
+            staff=note_info['staff'],
+            measure_number=note_info['measure_number'],
         )
         self.played_notes.append(principal)
+    
     def _resolve_ties(self):
         """Merge tied notes into single sustained notes"""
         # Group notes by signature

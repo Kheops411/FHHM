@@ -1,5 +1,5 @@
 import numpy as np
-from . import utils  # Utilisation de l'import relatif standard
+from python import utils
 
 class HMMTrainer:
     def __init__(self, order=2, epsilon=1e-3, tr_sym=False, rf_sym=False):
@@ -32,12 +32,7 @@ class HMMTrainer:
 
     def train(self, score_files: list):
         for filepath in score_files:
-            try:
-                notes = utils.load_pig_file(filepath)
-            except Exception as e:
-                print(f"Skipping {filepath}: {e}")
-                continue
-                
+            notes = utils.load_pig_file(filepath)
             # CRITICAL: Must use the exact same ordering as C++ to compute valid transitions
             ordered_notes = utils.apply_time_dep_pitch_order(notes)
 
@@ -49,6 +44,8 @@ class HMMTrainer:
                     continue
 
                 # --- Initial Probabilities ---
+                # C++ implementation typically only counts the very first note of the piece
+                # for ini_prob, even with symmetries enabled.
                 f0 = hand_notes[0]['finger']
                 if 1 <= abs(f0) <= 5:
                     self.ini_prob[hand, abs(f0) - 1] += 1
@@ -76,16 +73,21 @@ class HMMTrainer:
                     
                     # 2. Reflection Symmetry (Mirror Hand)
                     if self.rf_sym:
+                        # Hand: Opposite (1-h)
+                        # Delta: Invert X only (-dx, dy)
                         self._update_order1(1 - hand, idx_fn1, idx_fn, -dx1, dy1)
                     
                     # 3. Time Reversal Symmetry (Backward)
                     if self.tr_sym:
-                        # Direction: Current -> Previous (n -> n-1)
+                        # Direction: Current -> Previous
                         # Delta: Full Inversion (-dx, -dy)
                         self._update_order1(hand, idx_fn, idx_fn1, -dx1, -dy1)
                         
                         # 4. TR + RF Combined
                         if self.rf_sym:
+                            # Hand: Opposite
+                            # Direction: Current -> Previous
+                            # Delta: Mirror X of Reversed Time (-(-dx), -dy) -> (dx, -dy)
                             self._update_order1(1 - hand, idx_fn, idx_fn1, dx1, -dy1)
 
                     # --- Order 2 Updates ---
@@ -106,6 +108,8 @@ class HMMTrainer:
                             
                             # Time Reversal (n -> n-1 -> n-2)
                             if self.tr_sym:
+                                # Note: In C++ TRSym for order 2/3 updates transition: curr -> prev -> prev2
+                                # Delta must be reversed: n-2 minus n = -(n - n-2)
                                 self._update_order2(hand, idx_fn, idx_fn1, idx_fn2, -dx2, -dy2)
 
                                 if self.rf_sym:
@@ -192,6 +196,8 @@ class HMMTrainer:
                         if s_out3 > 0: self.out_prob3[h, i, j, :] /= s_out3
 
     def save_parameters(self, filepath):
+        # (Le code de sauvegarde reste identique à votre version précédente)
+        # Il est juste important que les matrices soient bien remplies avant.
         with open(filepath, 'w') as f:
             f.write("### Initial Prob Right\n")
             f.write('\t'.join(map(str, self.ini_prob[0])) + '\n')

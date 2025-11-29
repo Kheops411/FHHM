@@ -40,7 +40,7 @@ def compute_emission_score(delta_pitch: int, finger_idx: int) -> float:
     return np.log(z + epsilon)
 
 @nb.njit
-def compute_inertia_cost(k_prev: int, k_curr: int, dt: float, slope: float, center: float, weight: float) -> float:
+def compute_inertia_cost(physical_distance: float, dt: float, slope: float, center: float, weight: float) -> float:
     """
     Computes the inertia cost for hand movement.
     """
@@ -48,12 +48,6 @@ def compute_inertia_cost(k_prev: int, k_curr: int, dt: float, slope: float, cent
     stiffness = 1.0 / (1.0 + np.exp(slope * (dt - center)))
 
     # 2. Calculate Distance Cost
-    # Look up anchor values from indices
-    anchor_prev_val = ANCHORS[k_prev]
-    anchor_curr_val = ANCHORS[k_curr]
-
-    distance = np.abs(anchor_curr_val - anchor_prev_val)
-
-    cost = stiffness * distance * weight
+    cost = stiffness * physical_distance * weight
 
     return cost

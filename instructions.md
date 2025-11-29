@@ -57,8 +57,6 @@ We use an iterative approach (Expectation-Maximization):
 *   **Logic:** A dynamic "Time vs. Movement" check is added to every transition.
 *   **Training:** Simple counting is replaced by an iterative loop.
 
----
-
 ### Work Order: Soft-Position HMM Implementation
 
 We are deprecating the previous interval-based statistical model. We are moving to a new architecture called **"Soft-Position HMM"**.
@@ -180,6 +178,27 @@ $$ W_{f,i} = \exp\left( - \frac{(c_i - \mu_{init}^f)^2}{2(\sigma_{init}^f)^2} \r
 
 
 ---
+
+#### Usuful to know
+
+- The project involves refactoring a piano fingering algorithm into a 'Soft-Position' Hidden Markov Model (HMM). This model introduces a hand 'anchor' (k) to represent the hand's center of gravity and penalize large movements. The HMM state is (f_{t-2}, f_{t-1}, k_{t-1}).
+	
+- Python dependencies (numpy, numba, matplotlib, pytest, psutil) can be installed with pip install numpy numba matplotlib pytest psutil.
+
+- To update the local repository with the latest changes from the remote, run git checkout main followed by git pull origin main.
+	
+- The ViterbiLattice class in soft_position_hmm/structural.py is designed as a strict data container. Algorithmic logic, such as setting initial probabilities for t=0, should be handled outside of this class.
+
+- The ViterbiLattice backpointer tensor intentionally includes a redundant coordinate for prev_finger_1. This design simplifies the backtracking algorithm in Numba by making it stateless with respect to loop indices.
+	
+- Generated test artifacts, such as plots (.png files), should be saved in the tests/ directory.
+	
+- New Python packages must include an empty __init__.py file to be importable.
+	
+- The source code for the new 'Soft-Position' HMM is located in the soft_position_hmm/ directory.
+
+---
+
 
 # Developer Instructions: Milestone 1 - The Mathematical Core
 
@@ -424,3 +443,139 @@ Create `tests/test_milestone_2.py`. You must verify that the dimensions are exac
 1.  `soft_position_hmm/structural.py`
 2.  `tests/test_milestone_2.py`
 3.  Console output showing the exact shapes and memory usage in MB.
+
+---
+
+# Developer Instructions: Milestone 3 - The Forward Pass (Inference)
+
+## Project Context
+We now have the Physics Engine (`core.py`) and the Memory Structure (`structural.py`).
+It is time to implement the core algorithm: **The Viterbi Forward Pass**.
+
+This algorithm fills the lattice we created in Milestone 2. It finds the most probable path through the 3D state space.
+
+## 1. Environment & Setup
+
+1.  **File Structure:**
+    Create a new file `soft_position_hmm/inference.py`.
+
+2.  **Dependencies:**
+    You will need `numba` for speed. Python loops are too slow for this 5-level nested operation.
+
+## 2. Implementation: `inference.py`
+
+You need to write a JIT-compiled function that takes the notes and the lattice, and computes the path.
+
+### Step 2.1: The Function Signature
+Define the function as follows:
+
+```python
+import numpy as np
+import numba as nb
+from .core import compute_emission_score, compute_inertia_cost, ANCHORS
+
+@nb.njit(cache=True)
+def run_forward_pass(
+    n_obs: int,
+    notes_pitch: np.ndarray, # Int32 array of pitches
+    notes_ontime: np.ndarray, # Float64 array of onsets
+    lattice_log_probs: np.ndarray,
+    lattice_backpointers: np.ndarray,
+    agility_matrix: np.ndarray, # Shape (5, 5, 5) -> log probs
+    inertia_param_slope: float,
+    inertia_param_center: float,
+    inertia_weight: float
+):
+    """
+    Fills the lattice_log_probs and lattice_backpointers in-place.
+    """
+    # ... implementation ...
+```
+
+### Step 2.2: Algorithm Logic (The Nested Loops)
+
+This is the most critical part. Read carefully. The state at time $t$ is $(f_{prev}, f_{curr}, k_{curr})$.
+
+**A. Initialization (t = 0)**
+At the first note, we have no history. We must define the probabilities for all possible starting states $(f_0, k_0)$.
+*   Loop over all `f_curr` (0-4) and `k_curr` (0-8).
+*   Compute `emit = compute_emission_score(...)`.
+*   Assign `lattice_log_probs[0, :, f_curr, k_curr] = emit`.
+*   *Note:* Since there is no previous finger, we broadcast the same value to all `f_prev` indices at $t=0$, or just loop `f_prev` and assign the same value.
+
+**B. Recursion (t = 1 to n_obs - 1)**
+You must construct a loop structure that iterates through time. Inside, you calculate the max probability coming from the previous time step.
+
+**Loop Hierarchy:**
+1.  `for t` in `1` to `n_obs-1`:
+    2.  Calculate `dt = notes_ontime[t] - notes_ontime[t-1]`.
+    3.  `for f_curr` (Target Finger):
+        4.  `for k_curr` (Target Anchor):
+            5.  `emit = compute_emission_score(...)` (Depends on `notes_pitch[t]`, `f_curr`, `k_curr`).
+            6.  `for f_prev` (The "Connector"):
+                *   *Crucial:* `f_prev` is the **Previous Finger**. It is part of the *Target State* index, but it was the *Current Finger* in the previous timestep.
+                7.  **Find the Best Previous Context:**
+                    Initialize `max_prob = -inf`
+                    Initialize `best_k_prev = -1`, `best_f_prev2 = -1`
+                    
+                    8.  `for k_prev` (Previous Anchor):
+                        *   `inertia = compute_inertia_cost(...)` (Using `dt`).
+                        
+                        9.  `for f_prev2` (Finger at t-2):
+                            *   `prev_prob = lattice_log_probs[t-1, f_prev2, f_prev, k_prev]`
+                            *   `agility = agility_matrix[f_prev2, f_prev, f_curr]`
+                            *   `candidate = prev_prob + agility + inertia + emit`
+                            
+                            *   **Update Max:** If `candidate > max_prob`, update `max_prob` and record `k_prev`, `f_prev2`.
+                    
+                    10. **Store Result:**
+                        `lattice_log_probs[t, f_prev, f_curr, k_curr] = max_prob`
+                        `lattice_backpointers[t, f_prev, f_curr, k_curr, 0] = best_f_prev2`
+                        `lattice_backpointers[t, f_prev, f_curr, k_curr, 1] = f_prev`
+                        `lattice_backpointers[t, f_prev, f_curr, k_curr, 2] = best_k_prev`
+
+## 3. Validation: `test_milestone_3.py`
+
+Create `tests/test_milestone_3.py`.
+Since we cannot perform the full training yet, we will validate using a **synthetic micro-scenario**.
+
+### The Scenario: "The Impossible Stretch"
+We will create a sequence of 3 notes:
+1.  **Note 0:** Pitch 60 (C4).
+2.  **Note 1:** Pitch 72 (C5) - 1 octave up.
+3.  **Note 2:** Pitch 60 (C4) - Back down.
+
+**Conditions:**
+*   `dt` is very small (0.05s) -> High Inertia Cost (Hand shouldn't move).
+*   But the interval is 12 semitones. No single hand position can reach both C4 and C5 comfortably without moving.
+
+**Test Setup:**
+1.  Create dummy `notes_pitch = [60, 72, 60]`.
+2.  Create dummy `notes_ontime = [0.0, 0.05, 0.10]`.
+3.  Create a dummy `agility_matrix` filled with `0.0` (ignore finger agility for this test).
+4.  Initialize `ViterbiLattice(3)`.
+5.  Run `run_forward_pass`.
+
+**Verification Logic (The "Probe"):**
+After running the pass, inspect `lattice_log_probs` at `t=1` (The middle note, C5).
+*   **Case A (Static Hand):** Look at probabilities where `k_curr` is same as `t=0`. They should be very low (bad emission score for reaching C5 from a C4 anchor).
+*   **Case B (Moving Hand):** Look at probabilities where `k_curr` has shifted to the right. They should be higher (good emission), *even though* inertia cost was applied.
+*   **Action:** Find the indices `(f_prev, f_curr, k_curr)` that have the **maximum** value in the entire lattice at `t=1` and `t=2`.
+*   Print: "Best Anchor at t=1: ...", "Best Anchor at t=2: ..."
+
+**Success Criteria:**
+The test passes if the code runs without error and produces a chosen path where the probabilities are not all `-inf`.
+
+## 4. Debugging Guidelines
+
+1.  **Initialization Error:** If your results are all `-inf`, check your `t=0` loop. Did you add the emission score?
+2.  **Index Out of Bounds:** Ensure `f_prev` loop goes 0-4 and `k_prev` goes 0-8.
+3.  **Variable Confusion:** Be very careful with `f_prev` vs `f_prev2`.
+    *   `f_prev` is the *row* of the lattice at time `t`.
+    *   `f_prev` is the *column* of the lattice at time `t-1`.
+    *   `f_prev2` is the *row* of the lattice at time `t-1`.
+
+**Deliverables for Milestone 3:**
+1.  `soft_position_hmm/inference.py`
+2.  `tests/test_milestone_3.py`
+3.  Console output showing the "Best Anchor" selected by the algorithm for the test sequence.

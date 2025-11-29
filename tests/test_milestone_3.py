@@ -37,7 +37,9 @@ def test_impossible_stretch():
         agility_matrix=agility_matrix,
         inertia_param_slope=model.time_slope,
         inertia_param_center=model.time_center,
-        inertia_weight=model.inertia_weight
+        inertia_weight=model.inertia_weight,
+        rbf_mu=model.rbf_mu,
+        rbf_sigma=model.rbf_sigma
     )
 
     # 3. Verification Logic

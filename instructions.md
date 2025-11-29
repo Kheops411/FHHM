@@ -617,13 +617,13 @@ def backtracking(
     """
     # 1. Find the best ending state at t = n_obs - 1
     # We need to find indices (f_prev, f_curr, k_curr) that maximize log_probs[-1]
-    
+
     # ... Implementation ...
-    
+
     # 2. Iterate backwards from t = n_obs - 1 down to 0
     # Use the lattice_backpointers to jump to the previous state.
-    
-    # Return two arrays: 
+
+    # Return two arrays:
     #   opt_fingers (int32 array of shape n_obs)
     #   opt_anchors (int32 array of shape n_obs, storing INDICES of anchors)
 ```
@@ -648,8 +648,8 @@ from .utils import load_pig_file, apply_time_dep_pitch_order, filter_notes_by_ha
 class SoftPositionTrainer:
     def __init__(self):
         self.model = SoftPositionModel()
-        # Initialize Agility Matrix (Transitions) separately 
-        # (Start with uniform probabilities or load from old HMM if available, 
+        # Initialize Agility Matrix (Transitions) separately
+        # (Start with uniform probabilities or load from old HMM if available,
         # for M4 we will init with zeros log-prob).
         self.agility_matrix = np.zeros((5, 5, 5), dtype=np.float64)
 
@@ -659,34 +659,34 @@ class SoftPositionTrainer:
         """
         for it in range(n_iterations):
             print(f"--- Iteration {it + 1}/{n_iterations} ---")
-            
+
             total_log_likelihood = 0.0
-            
+
             # Accumulators for the M-Step
             # We need to collect observed delta_pitches for each finger to update RBFs
             # Structure: List of lists, or large arrays.
             # finger_deltas[finger_idx] -> [delta1, delta2, ...]
             finger_deltas = [[] for _ in range(N_FINGERS)]
-            
+
             for fpath in file_paths:
                 # 1. Load Data
                 # ... (Use utils to load and filter for Right Hand only for now) ...
-                
+
                 # 2. E-Step: Guess the Anchors
                 # We know the TRUE fingers from the PIG file.
                 # We need to run a "Constrained Viterbi":
                 # Only explore states where f_curr == true_finger.
-                
+
                 # ... (See logic detailed below) ...
-                
+
                 # 3. Collect Statistics
                 # Once we have the path of anchors, we calculate:
                 # delta = note_pitch - ANCHOR_VALUE[opt_anchor]
                 # Store this delta in the list for the corresponding finger.
-            
+
             # 4. M-Step: Update Parameters
             self._update_parameters(finger_deltas)
-            
+
             print(f"Total Log Likelihood: {total_log_likelihood}")
 
     def _update_parameters(self, finger_deltas):

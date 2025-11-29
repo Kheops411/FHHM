@@ -331,3 +331,96 @@ If the test fails, do **not** change the code randomly.
 2.  `tests/test_milestone_1.py`
 3.  The generated plot image (`hand_shape_test.png`).
 4.  The text output of the Inertia table.
+
+# Developer Instructions: Milestone 2 - The Data Structures (State Space)
+
+## Project Context
+In Milestone 1, we validated the physics engine.
+In Milestone 2, we define the **State Space** for the HMM.
+Unlike the old model which used 2D matrices (`5x5`), the Soft-Position HMM uses a **3D State**:
+$$ S_t = (\text{Finger}_{t-1}, \text{Finger}_{t}, \text{Anchor}_{t}) $$
+
+We need to create the structural code that allocates memory for this 3D lattice and manages the dimensions.
+
+## 1. Environment & Setup
+
+1.  **Install Dependencies:**
+    You need `psutil` to verify memory consumption in your tests.
+    ```bash
+    pip install psutil
+    ```
+
+2.  **File Structure:**
+    Create a new file `soft_position_hmm/structural.py`.
+
+## 2. Implementation: `structural.py`
+
+This file handles the allocation of the Viterbi Trellis (the grid of probabilities).
+
+### Step 2.1: Constants & Dimensions
+Import `ANCHORS` from `core.py` to ensure consistency.
+
+**Requirements:**
+*   Define `N_FINGERS = 5`.
+*   Define `N_ANCHORS = len(ANCHORS)`.
+*   Define `N_STATES = N_FINGERS * N_FINGERS * N_ANCHORS` (Should be $5 \times 5 \times 9 = 225$).
+
+### Step 2.2: The `ViterbiLattice` Class
+Create a class `ViterbiLattice`.
+The `__init__` method must take `n_obs` (number of notes) as an input and allocate **Numpy arrays** filled with zeros (or `-inf` for probabilities).
+
+**Required Tensors (Attributes):**
+
+1.  **`log_probs`**:
+    *   **Shape:** `(n_obs, N_FINGERS, N_FINGERS, N_ANCHORS)`
+    *   **Dtype:** `np.float64`
+    *   **Initialization:** Fill with `-np.inf` (Log-space zero).
+    *   *Explanation:* Stores the max probability of reaching state $(f_{t-1}, f_t, k_t)$ at time $t$.
+
+2.  **`backpointers`**:
+    *   **Shape:** `(n_obs, N_FINGERS, N_FINGERS, N_ANCHORS, 3)`
+    *   **Dtype:** `np.int8` (to save memory, fingers are 0-4, anchors 0-8).
+    *   **Initialization:** Fill with `-1`.
+    *   *Explanation:* Stores the coordinates of the *previous* state that led to the current max probability.
+        *   Index 0: `prev_finger_2` ($f_{t-2}$)
+        *   Index 1: `prev_finger_1` ($f_{t-1}$)
+        *   Index 2: `prev_anchor` ($k_{t-1}$)
+
+**Debug Requirement:**
+Inside `__init__`, add a print statement (commented out by default, but you must write it) that calculates the size of these arrays in Megabytes and prints it.
+`# print(f"Allocated Lattice: {size_in_mb:.2f} MB")`
+
+## 3. Validation: `test_milestone_2.py`
+
+Create `tests/test_milestone_2.py`. You must verify that the dimensions are exactly as expected and that the memory layout is correct.
+
+### Test A: Dimension Integrity
+1.  Initialize `ViterbiLattice` with `n_obs = 100`.
+2.  Assert that `log_probs.shape` is exactly `(100, 5, 5, 9)`.
+3.  Assert that `backpointers.shape` is exactly `(100, 5, 5, 9, 3)`.
+4.  Assert that `log_probs[0, 0, 0, 0]` is `-inf`.
+5.  **Debug Print:** Print the shapes to the console.
+
+### Test B: Large Scale Memory Check
+1.  Initialize `ViterbiLattice` with `n_obs = 10,000` (A very long concerto).
+2.  Use `psutil` or `nbytes` to calculate the memory usage.
+3.  **Constraint:** The total memory must be under **500 MB**.
+    *   *Math check:* $10000 \times 225 \times 8$ bytes (float64) $\approx 18$ MB. $10000 \times 225 \times 3$ bytes (int8) $\approx 6.75$ MB. Total should be $\approx 25$ MB.
+    *   If your test reports huge numbers (GBs), you have an error in your dimension logic.
+4.  **Debug Print:** Print the calculated size in MB.
+
+### Test C: Coordinate Mapping Sanity
+1.  Verify that `N_ANCHORS` imported from `structural` matches `len(ANCHORS)` from `core`.
+2.  Write a loop that iterates through every dimension of the `log_probs` array for `t=0` and sets a value (e.g., `1.0`).
+3.  Verify that no `IndexError` is raised.
+
+## 4. Debugging Guidelines for Milestone 2
+
+*   **If you get an `IndexError`:** Check the order of dimensions. Is it `(t, f_prev, f_curr, k)` or `(t, k, f_prev, f_curr)`? Stick strictly to **`(Time, F_prev, F_curr, Anchor)`**.
+*   **If memory usage is high:** Check your Dtypes. `backpointers` do not need `int64` or `float64`. Use `int8`.
+*   **If `backpointers` shape is wrong:** Remember the last dimension is `3` because we need to point back to a triplet $(f_{t-2}, f_{t-1}, k_{t-1})$. Even though $f_{t-1}$ is redundant (it is part of the current state), we store it for explicit clarity during the backtracking phase.
+
+**Deliverables for Milestone 2:**
+1.  `soft_position_hmm/structural.py`
+2.  `tests/test_milestone_2.py`
+3.  Console output showing the exact shapes and memory usage in MB.

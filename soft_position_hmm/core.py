@@ -1,9 +1,8 @@
 import numpy as np
 import numba as nb
 
-# ANCHORS: The relative hand positions.
-# Range: -12 (hand to the left) to +12 (hand to the right) step 3
-ANCHORS = np.array([-12, -9, -6, -3, 0, 3, 6, 9, 12], dtype=np.int32)
+# Range -12 to +12 with step 1 (was step 3)
+ANCHORS = np.arange(-12, 13, 1, dtype=np.int32)
 
 class SoftPositionModel:
     def __init__(self):

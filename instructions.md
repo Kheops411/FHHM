@@ -184,9 +184,9 @@ $$ W_{f,i} = \exp\left( - \frac{(c_i - \mu_{init}^f)^2}{2(\sigma_{init}^f)^2} \r
 - The emission score's delta_pitch in the Soft-Position HMM is calculated as the negative value of the current anchor, representing the distance from the hand's center to the key: emit = compute_emission_score(-ANCHORS[k_curr], f_curr).
 
 - The inertia cost for the Soft-Position HMM is based on the physical distance the hand center moves. This distance is calculated as abs((notes_pitch[t] + ANCHORS[k_curr]) - (notes_pitch[t-1] + ANCHORS[k_prev])).
-	
+
 - For Numba-jitted functions to work in nopython mode, avoid passing complex Python objects like class instances. Instead, pass the necessary attributes as primitive types (e.g., floats, ints, numpy arrays).
-	
+
 - In the Soft-Position HMM's Viterbi algorithm, the inertia cost (a positive energy penalty) must be subtracted when calculating the candidate log-probability: candidate = prev_prob + agility - inertia + emit.
 
 - The project involves refactoring a piano fingering algorithm into a 'Soft-Position' Hidden Markov Model (HMM). This model introduces a hand 'anchor' (k) to represent the hand's center of gravity and penalize large movements. The HMM state is (f_{t-2}, f_{t-1}, k_{t-1}).
@@ -617,13 +617,13 @@ def backtracking(
     """
     # 1. Find the best ending state at t = n_obs - 1
     # We need to find indices (f_prev, f_curr, k_curr) that maximize log_probs[-1]
-    
+
     # ... Implementation ...
-    
+
     # 2. Iterate backwards from t = n_obs - 1 down to 0
     # Use the lattice_backpointers to jump to the previous state.
-    
-    # Return two arrays: 
+
+    # Return two arrays:
     #   opt_fingers (int32 array of shape n_obs)
     #   opt_anchors (int32 array of shape n_obs, storing INDICES of anchors)
 ```
@@ -648,8 +648,8 @@ from .utils import load_pig_file, apply_time_dep_pitch_order, filter_notes_by_ha
 class SoftPositionTrainer:
     def __init__(self):
         self.model = SoftPositionModel()
-        # Initialize Agility Matrix (Transitions) separately 
-        # (Start with uniform probabilities or load from old HMM if available, 
+        # Initialize Agility Matrix (Transitions) separately
+        # (Start with uniform probabilities or load from old HMM if available,
         # for M4 we will init with zeros log-prob).
         self.agility_matrix = np.zeros((5, 5, 5), dtype=np.float64)
 
@@ -659,34 +659,34 @@ class SoftPositionTrainer:
         """
         for it in range(n_iterations):
             print(f"--- Iteration {it + 1}/{n_iterations} ---")
-            
+
             total_log_likelihood = 0.0
-            
+
             # Accumulators for the M-Step
             # We need to collect observed delta_pitches for each finger to update RBFs
             # Structure: List of lists, or large arrays.
             # finger_deltas[finger_idx] -> [delta1, delta2, ...]
             finger_deltas = [[] for _ in range(N_FINGERS)]
-            
+
             for fpath in file_paths:
                 # 1. Load Data
                 # ... (Use utils to load and filter for Right Hand only for now) ...
-                
+
                 # 2. E-Step: Guess the Anchors
                 # We know the TRUE fingers from the PIG file.
                 # We need to run a "Constrained Viterbi":
                 # Only explore states where f_curr == true_finger.
-                
+
                 # ... (See logic detailed below) ...
-                
+
                 # 3. Collect Statistics
                 # Once we have the path of anchors, we calculate:
                 # delta = note_pitch - ANCHOR_VALUE[opt_anchor]
                 # Store this delta in the list for the corresponding finger.
-            
+
             # 4. M-Step: Update Parameters
             self._update_parameters(finger_deltas)
-            
+
             print(f"Total Log Likelihood: {total_log_likelihood}")
 
     def _update_parameters(self, finger_deltas):
@@ -773,10 +773,10 @@ def predict_fingering(
     n_obs = len(notes_pitch)
     if n_obs == 0:
         return np.array([], dtype=np.int32)
-    
+
     # 1. Setup Data Structures
     lattice = ViterbiLattice(n_obs)
-    
+
     # Default agility if None (Zero log-prob = Uniform)
     if agility_matrix is None:
         agility_matrix = np.zeros((5, 5, 5), dtype=np.float64)
@@ -798,11 +798,11 @@ def predict_fingering(
 
     # 3. Backtrack
     fingers, anchors = backtracking(
-        n_obs, 
-        lattice.log_probs, 
+        n_obs,
+        lattice.log_probs,
         lattice.backpointers
     )
-    
+
     return fingers, anchors
 ```
 
@@ -853,59 +853,59 @@ def main():
     print("1. Parsing XML...")
     parser = MusicXMLParser(xml_path)
     all_notes = parser.parse()
-    
+
     # Filter for LEFT HAND (Hand.LEFT is usually 1)
     lh_notes = [n for n in all_notes if n.hand == Hand.LEFT]
     lh_notes.sort(key=lambda x: x.onset)
-    
+
     print(f"   Found {len(lh_notes)} Left Hand notes.")
-    
+
     # Extract arrays
     pitches = np.array([n.pitch for n in lh_notes], dtype=np.int32)
     ontimes = np.array([n.onset_seconds for n in lh_notes], dtype=np.float64)
-    
+
     print("2. Initializing Soft-Position Model...")
     model = SoftPositionModel()
-    
+
     # --- MANUAL TUNING FOR DEMONSTRATION ---
     # Since we lack a trained model, we hardcode reasonable physics
-    # Left Hand Logic: 
+    # Left Hand Logic:
     # Thumb (Finger 0 in index) is to the RIGHT of the hand center (High pitch)
     # Pinky (Finger 4 in index) is to the LEFT of the hand center (Low pitch)
-    # WAIT! The model code assumes RH. 
+    # WAIT! The model code assumes RH.
     # For LH, we must invert the geometry input OR invert the parameters.
     # EASIEST FIX: Invert the PITCHES before sending to model, then interpret result as inverted.
     # Let's try to simulate RH physics by mirroring the LH pitches.
     # Inverted Pitch = 128 - Pitch.
-    
+
     print("   ...Inverting Left Hand pitches to simulate Right Hand model...")
     inverted_pitches = 128 - pitches
-    
+
     # Increase Inertia to punish the "2-1" jitter
-    model.inertia_weight = 3.0 
-    
+    model.inertia_weight = 3.0
+
     print("3. Running Inference...")
     fingers_indices, anchors_indices = predict_fingering(
-        inverted_pitches, 
-        ontimes, 
+        inverted_pitches,
+        ontimes,
         model
     )
-    
+
     # Convert finger indices (0-4) back to 1-5
     fingers = fingers_indices + 1
-    
+
     print("4. Analyzing First 4 Measures (Approx 32 notes)...")
     print(f"{'Time':<8} | {'Note':<6} | {'Finger':<6} | {'Anchor':<6}")
     print("-" * 40)
-    
+
     previous_anchor = -999
-    
+
     for i in range(min(32, len(fingers))):
         pitch_name = lh_notes[i].pitch # Keep original pitch for display
         f = fingers[i]
         a_idx = anchors_indices[i]
         a_val = ANCHORS[a_idx]
-        
+
         # Check stability
         anchor_status = ""
         if i > 0:
@@ -913,9 +913,9 @@ def main():
                 anchor_status = "(Stable)"
             else:
                 anchor_status = "--> MOVE"
-        
+
         print(f"{ontimes[i]:<8.2f} | {pitch_name:<6} | {f:<6} | {a_val:<6} {anchor_status}")
-        
+
         previous_anchor = a_val
 
 if __name__ == "__main__":

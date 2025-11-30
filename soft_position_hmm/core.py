@@ -24,19 +24,16 @@ def compute_emission_score(delta_pitch: int, finger_idx: int, rbf_mu: np.ndarray
     """
     Computes the emission score using a simplified Gaussian.
     """
-    epsilon = 1e-9 # To avoid log(0) or division by zero
+    epsilon = 1e-9
+    sigma_min = 1.0
 
     ideal_offset = rbf_mu[finger_idx]
     width = rbf_sigma[finger_idx]
 
-    # Ensure width is not zero
-    if width < epsilon:
-        width = epsilon
+    if width < sigma_min:
+        width = sigma_min
 
-    # Simplified Gaussian RBF
     z = np.exp(-((delta_pitch - ideal_offset)**2) / (2 * width**2))
-
-    # Return log probability
     return np.log(z + epsilon)
 
 @nb.njit

@@ -7,7 +7,8 @@ def predict_fingering(
     notes_pitch: np.ndarray,
     notes_ontime: np.ndarray,
     model: SoftPositionModel,
-    agility_matrix: np.ndarray = None
+    agility_matrix: np.ndarray = None,
+    smoothing_weight: float = 0.0
 ):
     """
     High-level API to predict fingerings for a sequence of notes.
@@ -35,7 +36,8 @@ def predict_fingering(
         inertia_param_center=model.time_center,
         inertia_weight=model.inertia_weight,
         rbf_mu=model.rbf_mu,
-        rbf_sigma=model.rbf_sigma
+        rbf_sigma=model.rbf_sigma,
+        smoothing_weight=smoothing_weight
     )
 
     # 3. Backtrack

@@ -15,7 +15,8 @@ def run_forward_pass(
     inertia_param_center: float,
     inertia_weight: float,
     rbf_mu: np.ndarray,
-    rbf_sigma: np.ndarray
+    rbf_sigma: np.ndarray,
+    smoothing_weight: float
 ):
     """
     Fills the lattice_log_probs and lattice_backpointers in-place.
@@ -55,7 +56,8 @@ def run_forward_pass(
                             prev_prob = lattice_log_probs[t-1, f_prev2, f_prev, k_prev]
                             agility = agility_matrix[f_prev2, f_prev, f_curr]
 
-                            candidate = prev_prob + agility - inertia + emit
+                            smoothing = np.abs(ANCHORS[k_curr] - ANCHORS[k_prev]) * smoothing_weight
+                            candidate = prev_prob + agility - inertia - smoothing + emit
 
                             if candidate > max_prob:
                                 max_prob = candidate
@@ -81,7 +83,8 @@ def run_constrained_forward_pass(
     inertia_param_center: float,
     inertia_weight: float,
     rbf_mu: np.ndarray,
-    rbf_sigma: np.ndarray
+    rbf_sigma: np.ndarray,
+    smoothing_weight: float
 ):
     """
     A constrained version of the forward pass that forces the path to use
@@ -118,7 +121,10 @@ def run_constrained_forward_pass(
                 for f_prev2 in range(N_FINGERS):
                     prev_prob = lattice_log_probs[t-1, f_prev2, f_prev, k_prev]
                     agility = agility_matrix[f_prev2, f_prev, f_curr]
-                    candidate = prev_prob + agility - inertia + emit
+
+                    smoothing = np.abs(ANCHORS[k_curr] - ANCHORS[k_prev]) * smoothing_weight
+                    candidate = prev_prob + agility - inertia - smoothing + emit
+
                     if candidate > max_prob:
                         max_prob = candidate
                         best_k_prev = k_prev

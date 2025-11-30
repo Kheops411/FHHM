@@ -39,7 +39,8 @@ def test_impossible_stretch():
         inertia_param_center=model.time_center,
         inertia_weight=model.inertia_weight,
         rbf_mu=model.rbf_mu,
-        rbf_sigma=model.rbf_sigma
+        rbf_sigma=model.rbf_sigma,
+        smoothing_weight=0.0
     )
 
     # 3. Verification Logic

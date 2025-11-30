@@ -25,12 +25,11 @@ def compute_emission_score(delta_pitch: int, finger_idx: int, rbf_mu: np.ndarray
     Computes the emission score using a simplified Gaussian.
     """
     epsilon = 1e-9
-    sigma_min = 1.0  # HARD CONSTRAINT
+    sigma_min = 1.0
 
     ideal_offset = rbf_mu[finger_idx]
     width = rbf_sigma[finger_idx]
 
-    # Enforce Floor
     if width < sigma_min:
         width = sigma_min
 

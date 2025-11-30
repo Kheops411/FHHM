@@ -10,10 +10,12 @@ class SoftPositionTrainer:
         # For M4, we initialize agility with zeros (uniform log-prob)
         self.agility_matrix = np.zeros((5, 5, 5), dtype=np.float64)
 
-    def train(self, file_paths: list, n_iterations: int = 5, smoothing_weight: float = 0.0):
+    def train(self, file_paths: list, n_iterations: int = 5, smoothing_weight: float = 0.0) -> list:
         """
-        Runs the EM training loop.
+        Runs the EM training loop. Returns list of Total Log Likelihoods per iteration.
         """
+        log_likelihood_history = [] # <--- NEW LIST
+
         for it in range(n_iterations):
             print(f"--- Iteration {it + 1}/{n_iterations} ---")
 
@@ -76,7 +78,10 @@ class SoftPositionTrainer:
             # 4. M-Step: Update Parameters
             self._update_parameters(finger_deltas)
 
+            log_likelihood_history.append(total_log_likelihood)
             print(f"Total Log Likelihood: {total_log_likelihood}")
+
+        return log_likelihood_history
 
     def _update_parameters(self, finger_deltas):
         """
@@ -89,5 +94,7 @@ class SoftPositionTrainer:
         for i in range(N_FINGERS):
             if len(finger_deltas[i]) > 1:
                 self.model.rbf_mu[i] = np.mean(finger_deltas[i])
-                self.model.rbf_sigma[i] = np.std(finger_deltas[i])
+                # Enforce a minimum sigma to prevent overfitting and divergence
+                new_sigma = np.std(finger_deltas[i])
+                self.model.rbf_sigma[i] = max(1.0, new_sigma)
         print("Model parameters updated.")

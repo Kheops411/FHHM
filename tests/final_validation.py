@@ -106,23 +106,25 @@ class FinalValidationTests(unittest.TestCase):
         data_path = generate_synthetic_data()
         trainer = SoftPositionTrainer()
 
-        # Capture log likelihoods
-        log_likelihoods = []
+        # Capture log likelihoods (returned by train)
+        # Suppress prints to keep test output clean
         original_stdout = sys.stdout
         sys.stdout = open(os.devnull, 'w')
         try:
-            for it in range(3):
-                trainer.train([data_path], n_iterations=1)
-                # This is a simplification; we'd ideally get LL from a return value
-                # For now, we assume the trainer is working if it doesn't decrease.
-                # A proper test would require modifying train() to return the LL.
-                # We will rely on the fact that EM should not decrease LL.
+            history = trainer.train([data_path], n_iterations=3)
         finally:
+            sys.stdout.close() # Close the null stream
             sys.stdout = original_stdout
 
-        # This is a weak test, but better than nothing.
-        # A real implementation would require train() to return likelihood.
-        print("Log likelihood check is simplified. Assuming non-decreasing behavior.")
+        print(f"Likelihood History: {history}")
+
+        self.assertEqual(len(history), 3)
+
+        # Check Monotonicity: Likelihood should NOT decrease significantly
+        # (Small fluctuations can happen due to float precision, but trend should be up)
+        improvement = history[-1] - history[0]
+        self.assertGreaterEqual(improvement, -1e-5, "Model diverged (Likelihood decreased).")
+
         print("[PASS] Training Convergence")
 
     def test_6_edge_case_impossible_jump(self):

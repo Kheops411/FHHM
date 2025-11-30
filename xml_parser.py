@@ -1197,7 +1197,7 @@ class MusicXMLParser:
         )
         self.played_notes.append(principal)
     def _resolve_ties(self):
-        """Merge tied notes into single sustained notes"""
+        """Merge tied notes into single sustained notes (Robust check)"""
         # Group notes by signature
         sig_groups = defaultdict(list)
         for note in self.played_notes:
@@ -1218,8 +1218,12 @@ class MusicXMLParser:
                     i += 1
                     continue
                 
-                # Check for tie start
+                # Check for tie start (look in both <tie> and notations/<tied>)
                 ties = [t.get('type') for t in xml.findall('tie')]
+                notations = xml.find('notations')
+                if notations is not None:
+                    ties.extend([t.get('type') for t in notations.findall('tied')])
+
                 if 'start' not in ties:
                     merged.append(note)
                     consumed.add(id(note))
@@ -1231,40 +1235,45 @@ class MusicXMLParser:
                 j = i + 1
                 while j < len(group):
                     next_note, next_xml = group[j]
+
+                    # Check next note ties
                     next_ties = [t.get('type') for t in next_xml.findall('tie')]
+                    next_notations = next_xml.find('notations')
+                    if next_notations is not None:
+                        next_ties.extend([t.get('type') for t in next_notations.findall('tied')])
                     
                     total_duration += next_note.duration
                     consumed.add(id(next_note))
                     
-                    if 'stop' in next_ties:
+                    if 'stop' in next_ties and 'start' not in next_ties:
                         j += 1
                         break
+                    if 'stop' in next_ties and 'start' in next_ties:
+                        # Continue chain
+                        j += 1
+                        continue
+
+                    # Safety break if no stop/start found (broken XML)
                     j += 1
+                    break
                 
                 # Create merged note
-                merged_note = PlayedNote(
-                    hand=note.hand,
-                    pitch=note.pitch,
-                    onset=note.onset,
-                    duration=total_duration,
-                    offset=note.onset + total_duration,
-                    velocity=note.velocity,
-                    xml_element=note.xml_element,
-                    source_tag='tied_note',
-                    voice=note.voice,
-                    staff=note.staff,
-                    measure_number=note.measure_number,
+                merged_note = self._create_played_note(
+                    {'xml': note.xml_element, 'midi': note.pitch, 'voice': note.voice,
+                     'staff': note.staff, 'measure_number': note.measure_number,
+                     'velocity': note.velocity, 'tempo': note.tempo},
+                    note.onset,
+                    total_duration,
+                    'tied_merged_note'
                 )
                 merged.append(merged_note)
                 consumed.add(id(note))
                 i = j
         
-        # Add non-tied notes
-        for note in self.played_notes:
-            if id(note) not in consumed:
-                merged.append(note)
-        
-        self.played_notes = merged
+        # Add non-tied notes that weren't part of any group
+        # (Already handled by consumed check logic, but ensure correct order)
+        final_list = sorted(merged, key=lambda x: (x.onset, x.pitch or 0))
+        self.played_notes = final_list
 
 # ============================================================================
 # Fingering Integration

@@ -181,6 +181,14 @@ $$ W_{f,i} = \exp\left( - \frac{(c_i - \mu_{init}^f)^2}{2(\sigma_{init}^f)^2} \r
 
 #### Usuful to know
 
+- The emission score's delta_pitch in the Soft-Position HMM is calculated as the negative value of the current anchor, representing the distance from the hand's center to the key: emit = compute_emission_score(-ANCHORS[k_curr], f_curr).
+
+- The inertia cost for the Soft-Position HMM is based on the physical distance the hand center moves. This distance is calculated as abs((notes_pitch[t] + ANCHORS[k_curr]) - (notes_pitch[t-1] + ANCHORS[k_prev])).
+
+- For Numba-jitted functions to work in nopython mode, avoid passing complex Python objects like class instances. Instead, pass the necessary attributes as primitive types (e.g., floats, ints, numpy arrays).
+
+- In the Soft-Position HMM's Viterbi algorithm, the inertia cost (a positive energy penalty) must be subtracted when calculating the candidate log-probability: candidate = prev_prob + agility - inertia + emit.
+
 - The project involves refactoring a piano fingering algorithm into a 'Soft-Position' Hidden Markov Model (HMM). This model introduces a hand 'anchor' (k) to represent the hand's center of gravity and penalize large movements. The HMM state is (f_{t-2}, f_{t-1}, k_{t-1}).
 	
 - Python dependencies (numpy, numba, matplotlib, pytest, psutil) can be installed with pip install numpy numba matplotlib pytest psutil.
@@ -579,3 +587,361 @@ The test passes if the code runs without error and produces a chosen path where 
 1.  `soft_position_hmm/inference.py`
 2.  `tests/test_milestone_3.py`
 3.  Console output showing the "Best Anchor" selected by the algorithm for the test sequence.
+
+
+# Developer Instructions: Milestone 4 - Backtracking & EM Training
+
+## Project Context
+The forward pass is complete. We now know the probability of the best path, but not the path itself.
+We need to:
+1.  **Backtrack:** Reconstruct the sequence of fingers and anchors.
+2.  **Train:** Use the "Expectation-Maximization" loop to refine the RBF hand shapes using real data.
+
+## 1. File Structure
+Create `soft_position_hmm/training.py`.
+
+## 2. Implementation: Backtracking (inference.py)
+
+First, add the backtracking function to `inference.py`.
+
+```python
+@nb.njit(cache=True)
+def backtracking(
+    n_obs: int,
+    lattice_log_probs: np.ndarray,
+    lattice_backpointers: np.ndarray
+):
+    """
+    Reconstructs the optimal path from the filled lattice.
+    Returns: (fingers, anchors) arrays.
+    """
+    # 1. Find the best ending state at t = n_obs - 1
+    # We need to find indices (f_prev, f_curr, k_curr) that maximize log_probs[-1]
+
+    # ... Implementation ...
+
+    # 2. Iterate backwards from t = n_obs - 1 down to 0
+    # Use the lattice_backpointers to jump to the previous state.
+
+    # Return two arrays:
+    #   opt_fingers (int32 array of shape n_obs)
+    #   opt_anchors (int32 array of shape n_obs, storing INDICES of anchors)
+```
+
+**Developer Note:**
+*   Remember that `lattice_log_probs` has shape `(T, 5, 5, 9)`. You need to find the `argmax` over the last 3 dimensions.
+*   The backpointer at `t` gives you the indices for `t-1`.
+
+## 3. Implementation: The EM Trainer (`training.py`)
+
+This class manages the dataset iteration and parameter updates.
+
+### Step 3.1: The `SoftPositionTrainer` Class
+
+```python
+import numpy as np
+from .core import SoftPositionModel, ANCHORS
+from .structural import ViterbiLattice, N_FINGERS, N_ANCHORS
+from .inference import run_forward_pass, backtracking
+from .utils import load_pig_file, apply_time_dep_pitch_order, filter_notes_by_hand
+
+class SoftPositionTrainer:
+    def __init__(self):
+        self.model = SoftPositionModel()
+        # Initialize Agility Matrix (Transitions) separately
+        # (Start with uniform probabilities or load from old HMM if available,
+        # for M4 we will init with zeros log-prob).
+        self.agility_matrix = np.zeros((5, 5, 5), dtype=np.float64)
+
+    def train(self, file_paths: list, n_iterations: int = 5):
+        """
+        Runs the EM loop.
+        """
+        for it in range(n_iterations):
+            print(f"--- Iteration {it + 1}/{n_iterations} ---")
+
+            total_log_likelihood = 0.0
+
+            # Accumulators for the M-Step
+            # We need to collect observed delta_pitches for each finger to update RBFs
+            # Structure: List of lists, or large arrays.
+            # finger_deltas[finger_idx] -> [delta1, delta2, ...]
+            finger_deltas = [[] for _ in range(N_FINGERS)]
+
+            for fpath in file_paths:
+                # 1. Load Data
+                # ... (Use utils to load and filter for Right Hand only for now) ...
+
+                # 2. E-Step: Guess the Anchors
+                # We know the TRUE fingers from the PIG file.
+                # We need to run a "Constrained Viterbi":
+                # Only explore states where f_curr == true_finger.
+
+                # ... (See logic detailed below) ...
+
+                # 3. Collect Statistics
+                # Once we have the path of anchors, we calculate:
+                # delta = note_pitch - ANCHOR_VALUE[opt_anchor]
+                # Store this delta in the list for the corresponding finger.
+
+            # 4. M-Step: Update Parameters
+            self._update_parameters(finger_deltas)
+
+            print(f"Total Log Likelihood: {total_log_likelihood}")
+
+    def _update_parameters(self, finger_deltas):
+        """
+        Re-estimates the ideal_offset and width for each finger based on collected data.
+        """
+        # For each finger 0-4:
+        #   mu = mean(collected_deltas)
+        #   sigma = std(collected_deltas)
+        # Update self.model.rbf_mu and self.model.rbf_sigma
+        pass
+```
+
+### Step 3.2: The "Constrained Viterbi" Logic
+For the training to work, we cannot just run the normal Viterbi. We must force the algorithm to respect the **Ground Truth Fingers** provided in the dataset.
+
+**Modification needed in `inference.py`:**
+Create a new function `run_constrained_forward_pass`.
+It is identical to `run_forward_pass` EXCEPT:
+*   Add argument `true_fingers: np.ndarray`.
+*   Inside the loops `for f_curr ...`:
+    *   Add check: `if f_curr != true_fingers[t] - 1: continue` (Assuming 1-based indexing in PIG).
+    *   (Careful with indexing: PIG fingers are 1..5, array indices are 0..4).
+*   Inside the loops `for f_prev ...`:
+    *   Add check: `if f_prev != true_fingers[t-1] - 1: continue`.
+
+**Task:** Implement `run_constrained_forward_pass` in `inference.py`.
+
+## 4. Validation: `test_milestone_4.py`
+
+This test is crucial. It proves the model is learning.
+
+1.  **Synthetic Data Generation:**
+    Create a fake dataset (list of notes) where the thumb always plays notes that are far to the left relative to the "average" position, and the pinky plays notes far to the right.
+2.  **Run Trainer:**
+    Run `SoftPositionTrainer.train` on this fake data for 5 iterations.
+3.  **Check Convergence:**
+    *   Verify that `model.rbf_mu[0]` (Thumb) becomes negative.
+    *   Verify that `model.rbf_mu[4]` (Pinky) becomes positive.
+    *   Verify that `total_log_likelihood` increases (becomes less negative).
+
+**Deliverables for Milestone 4:**
+1.  `inference.py` (Added `backtracking` and `run_constrained_forward_pass`).
+2.  `training.py` (Full class).
+3.  `tests/test_milestone_4.py` (Proof of learning).
+
+**Critical Instruction:**
+For the M-Step (`_update_parameters`), do NOT update the `inertia` parameters yet. Only update `rbf_mu` and `rbf_sigma`. Updating inertia requires more complex math (gradient descent) which we will skip for this milestone. Focus on learning the Hand Shape.
+
+# Developer Instructions: Milestone 5 - Integration & The Bach Test
+
+## Project Context
+We have a working Soft-Position HMM (`inference.py`) and a Training Loop (`training.py`).
+We also have a powerful XML parser (`xml_parser.py`) that can read the Bach Prelude.
+
+Goal:
+1.  **Adapt Data:** Convert the `PlayedNote` objects from the XML parser into the numpy arrays (`pitch`, `ontime`) required by our HMM.
+2.  **Run Inference:** Apply the untrained (initialized) model on Bach.
+3.  **Run Inference (Trained):** (Optional/Future) Apply the trained model.
+4.  **Visualize/Export:** Output the predicted fingerings.
+
+## 1. File Structure
+Create `soft_position_hmm/interface.py`. This module will act as the API for external scripts.
+
+## 2. Implementation: `interface.py`
+
+This file bridges the gap between the raw `xml_parser` output and the HMM.
+
+```python
+import numpy as np
+from .core import SoftPositionModel, ANCHORS
+from .structural import ViterbiLattice, N_FINGERS, N_ANCHORS
+from .inference import run_forward_pass, backtracking
+
+def predict_fingering(
+    notes_pitch: np.ndarray,
+    notes_ontime: np.ndarray,
+    model: SoftPositionModel,
+    agility_matrix: np.ndarray = None
+):
+    """
+    High-level API to predict fingerings for a sequence of notes.
+    """
+    n_obs = len(notes_pitch)
+    if n_obs == 0:
+        return np.array([], dtype=np.int32)
+
+    # 1. Setup Data Structures
+    lattice = ViterbiLattice(n_obs)
+
+    # Default agility if None (Zero log-prob = Uniform)
+    if agility_matrix is None:
+        agility_matrix = np.zeros((5, 5, 5), dtype=np.float64)
+
+    # 2. Run Forward Pass
+    run_forward_pass(
+        n_obs=n_obs,
+        notes_pitch=notes_pitch,
+        notes_ontime=notes_ontime,
+        lattice_log_probs=lattice.log_probs,
+        lattice_backpointers=lattice.backpointers,
+        agility_matrix=agility_matrix,
+        inertia_param_slope=model.time_slope,
+        inertia_param_center=model.time_center,
+        inertia_weight=model.inertia_weight,
+        rbf_mu=model.rbf_mu,
+        rbf_sigma=model.rbf_sigma
+    )
+
+    # 3. Backtrack
+    fingers, anchors = backtracking(
+        n_obs,
+        lattice.log_probs,
+        lattice.backpointers
+    )
+
+    return fingers, anchors
+```
+
+## 3. The Bach Test Script: `run_bach_test.py`
+
+Create a script `run_bach_test.py` in the root directory. This script will orchestrate the full pipeline.
+
+**Logic Requirements:**
+1.  **Import Parser:** Use `xml_parser.py` (ensure it's in the path or copy it to root).
+2.  **Load Bach:** Parse `./Prélude No. 1 en C Majeur-Piano.xml`.
+3.  **Filter Hand:** The Bach Prelude is famous for its patterns. We want to test the **Left Hand** specifically, as that was the source of the "2-1-2-1" error.
+    *   *Note:* The XML parser marks Left Hand as `note.staff == 2` or `note.hand == 1`.
+4.  **Prepare Data:**
+    *   Sort notes by onset.
+    *   Extract `pitch` (int) and `onset_seconds` (float).
+5.  **Initialize Model:** Create a `SoftPositionModel`.
+    *   *Manual Tweak:* Since we haven't trained on a massive dataset yet, manually set the RBF parameters to "sensible" defaults inside the script to give the model a fighting chance.
+    *   *Thumb (1):* `mu = -5.0`
+    *   *Pinky (5):* `mu = +5.0`
+    *   *Inertia Weight:* `2.0` (Make hand movement expensive).
+6.  **Run Prediction:** Call `predict_fingering`.
+7.  **Analyze Results:**
+    *   Loop through the first 4 measures (approx 32 notes).
+    *   Print the sequence: `Pitch | Finger | Anchor`.
+    *   **Check for the "2-1-2-1" vs "5-1" or "5-2" pattern.**
+    *   *Goal:* We want to see if the model avoids the crazy hand-jumping "2-1" pattern.
+
+**Code Skeleton for `run_bach_test.py`:**
+
+```python
+import sys
+import numpy as np
+import os
+
+# Adjust path to find modules
+sys.path.append(os.getcwd())
+
+from xml_parser import MusicXMLParser, Hand
+from soft_position_hmm.core import SoftPositionModel, ANCHORS
+from soft_position_hmm.interface import predict_fingering
+
+def main():
+    xml_path = "Prélude No. 1 en C Majeur-Piano.xml"
+    if not os.path.exists(xml_path):
+        print(f"Error: {xml_path} not found.")
+        return
+
+    print("1. Parsing XML...")
+    parser = MusicXMLParser(xml_path)
+    all_notes = parser.parse()
+
+    # Filter for LEFT HAND (Hand.LEFT is usually 1)
+    lh_notes = [n for n in all_notes if n.hand == Hand.LEFT]
+    lh_notes.sort(key=lambda x: x.onset)
+
+    print(f"   Found {len(lh_notes)} Left Hand notes.")
+
+    # Extract arrays
+    pitches = np.array([n.pitch for n in lh_notes], dtype=np.int32)
+    ontimes = np.array([n.onset_seconds for n in lh_notes], dtype=np.float64)
+
+    print("2. Initializing Soft-Position Model...")
+    model = SoftPositionModel()
+
+    # --- MANUAL TUNING FOR DEMONSTRATION ---
+    # Since we lack a trained model, we hardcode reasonable physics
+    # Left Hand Logic:
+    # Thumb (Finger 0 in index) is to the RIGHT of the hand center (High pitch)
+    # Pinky (Finger 4 in index) is to the LEFT of the hand center (Low pitch)
+    # WAIT! The model code assumes RH.
+    # For LH, we must invert the geometry input OR invert the parameters.
+    # EASIEST FIX: Invert the PITCHES before sending to model, then interpret result as inverted.
+    # Let's try to simulate RH physics by mirroring the LH pitches.
+    # Inverted Pitch = 128 - Pitch.
+
+    print("   ...Inverting Left Hand pitches to simulate Right Hand model...")
+    inverted_pitches = 128 - pitches
+
+    # Increase Inertia to punish the "2-1" jitter
+    model.inertia_weight = 3.0
+
+    print("3. Running Inference...")
+    fingers_indices, anchors_indices = predict_fingering(
+        inverted_pitches,
+        ontimes,
+        model
+    )
+
+    # Convert finger indices (0-4) back to 1-5
+    fingers = fingers_indices + 1
+
+    print("4. Analyzing First 4 Measures (Approx 32 notes)...")
+    print(f"{'Time':<8} | {'Note':<6} | {'Finger':<6} | {'Anchor':<6}")
+    print("-" * 40)
+
+    previous_anchor = -999
+
+    for i in range(min(32, len(fingers))):
+        pitch_name = lh_notes[i].pitch # Keep original pitch for display
+        f = fingers[i]
+        a_idx = anchors_indices[i]
+        a_val = ANCHORS[a_idx]
+
+        # Check stability
+        anchor_status = ""
+        if i > 0:
+            if a_val == previous_anchor:
+                anchor_status = "(Stable)"
+            else:
+                anchor_status = "--> MOVE"
+
+        print(f"{ontimes[i]:<8.2f} | {pitch_name:<6} | {f:<6} | {a_val:<6} {anchor_status}")
+
+        previous_anchor = a_val
+
+if __name__ == "__main__":
+    main()
+```
+
+**Developer Note on Left Hand:**
+Our `core.py` (RBFs) is hardcoded for a **Right Hand** (Thumb=Left, Pinky=Right).
+To test the **Left Hand** of Bach, we employ a "Mirror Trick":
+1.  We transform the Left Hand notes: $P_{mirror} = 128 - P_{real}$.
+2.  High LH notes (Thumb) become Low RH notes (Pinky? No).
+    *   *Real LH Thumb (High)* $\to$ *Mirror (Low)*.
+    *   *Real LH Pinky (Low)* $\to$ *Mirror (High)*.
+    *   This maps LH Thumb $\to$ RH Pinky? That's confusing.
+    *   **Better Trick:** Just mirror the input $P_{input} = -P_{real}$.
+    *   Let's stick to the instruction in the code: `inverted_pitches = 128 - pitches`.
+    *   LH Thumb (e.g. 60) becomes $128-60 = 68$.
+    *   LH Pinky (e.g. 48) becomes $128-48 = 80$.
+    *   Wait, $80 > 68$. So Pinky becomes "Higher" than Thumb.
+    *   Standard RH: Pinky is Higher (Right) than Thumb (Left).
+    *   So yes, `128 - Pitch` correctly maps LH geometry to RH geometry.
+    *   **Result:** The model will predict "RH Finger 5" for the mirrored note 80. "RH Finger 5" is Pinky.
+    *   So the predicted finger "5" corresponds to the real LH finger "5" (Pinky).
+    *   It works directly!
+
+**Deliverables for Milestone 5:**
+1.  `soft_position_hmm/interface.py`
+2.  `run_bach_test.py`
+3.  Console output showing the finger sequence.

@@ -1,5 +1,5 @@
 import numpy as np
-from .core import SoftPositionModel, ANCHORS, FINGER_BASE_POS
+from .core import SoftPositionModel, ANCHORS, RH_FINGER_BASE_POS, LH_FINGER_BASE_POS
 from .structural import ViterbiLattice, N_FINGERS
 from .inference import run_constrained_forward_pass, backtracking
 from .utils import load_pig_file, apply_time_dep_pitch_order, FINGER_UNKNOWN, PITCH_TO_KEYPOS_LUT
@@ -28,10 +28,9 @@ class SoftPositionTrainer:
 
                 rh_notes = all_notes[all_notes['channel'] == 0]
                 lh_notes = all_notes[all_notes['channel'] == 1]
-                sequences_to_process = [rh_notes, lh_notes]
+                sequences_to_process = [(rh_notes, 'RH'), (lh_notes, 'LH')]
 
-                # MODIFIÉ: Utiliser enumerate pour identifier la main (0=RH, 1=LH)
-                for hand_idx, hand_notes in enumerate(sequences_to_process):
+                for hand_notes, hand_name in sequences_to_process:
                     if len(hand_notes) < 3:
                         continue
 
@@ -40,13 +39,15 @@ class SoftPositionTrainer:
                     notes_pitch = np.array([n['pitch'] for n in notes_sorted], dtype=np.int32)
                     notes_ontime = np.array([n['ontime'] for n in notes_sorted], dtype=np.float64)
 
-                    # MODIFIÉ: Préparer les coordonnées et les inverser pour la main gauche
                     notes_coord_x = PITCH_TO_KEYPOS_LUT[notes_pitch, 0].copy()
-                    if hand_idx == 1:  # Si c'est la main gauche
+                    if hand_name == 'LH':
                         notes_coord_x *= -1
+                        finger_base_pos_for_hand = LH_FINGER_BASE_POS
+                    else:
+                        finger_base_pos_for_hand = RH_FINGER_BASE_POS
 
                     true_fingers = np.array(
-                        [abs(n['finger']) if n['finger'] != FINGER_UNKNOWN else FINGER_UNKNOWN
+                        [abs(n['finger']) if n['finger'] != FINGER_UNKNOWN else FINGER_UNKNOWN # We use abs() because the hand (right/left) is determined by hand_name and the appropriate geometry is applied via finger_base_pos_for_hand
                          for n in notes_sorted],
                         dtype=np.int32
                     )
@@ -54,7 +55,7 @@ class SoftPositionTrainer:
                     lattice = ViterbiLattice(n_obs)
                     run_constrained_forward_pass(
                         n_obs=n_obs,
-                        notes_coord_x=notes_coord_x, # MODIFIÉ: Passer les coordonnées
+                        notes_coord_x=notes_coord_x,
                         notes_ontime=notes_ontime,
                         true_fingers=true_fingers,
                         lattice_log_probs=lattice.log_probs,
@@ -65,7 +66,8 @@ class SoftPositionTrainer:
                         inertia_weight=self.model.inertia_weight,
                         rbf_mu=self.model.rbf_mu,
                         rbf_sigma=self.model.rbf_sigma,
-                        smoothing_weight=smoothing_weight
+                        smoothing_weight=smoothing_weight,
+                        finger_base_pos=finger_base_pos_for_hand
                     )
 
                     final_log_prob = np.max(lattice.log_probs[-1])
@@ -79,7 +81,9 @@ class SoftPositionTrainer:
                             finger_idx = true_fingers[i] - 1
                             anchor_idx = opt_anchors[i]
                             
-                            delta = -ANCHORS[anchor_idx] - FINGER_BASE_POS[finger_idx]
+                            hand_pos_center_x = notes_coord_x[i] + ANCHORS[anchor_idx]
+                            finger_target_pos = hand_pos_center_x + finger_base_pos_for_hand[finger_idx]
+                            delta = notes_coord_x[i] - finger_target_pos
                             finger_deltas[finger_idx].append(delta)
 
                     for i in range(2, n_obs):

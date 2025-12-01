@@ -5,7 +5,6 @@ from .core import ANCHORS
 
 N_FINGERS = 5
 N_ANCHORS = len(ANCHORS)
-N_STATES = N_FINGERS * N_FINGERS * N_ANCHORS
 
 class ViterbiLattice:
     """

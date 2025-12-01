@@ -7,9 +7,6 @@ ANCHORS = np.arange(-12, 13, 1, dtype=np.int32)
 class SoftPositionModel:
     def __init__(self):
         # 1. Geometry Parameters (RBF)
-        # 5 fingers, 9 anchors.
-        self.rbf_weights = np.random.uniform(0, 1, (5, 9)).astype(np.float64)
-
         # Biomechanical Initialization to prevent getting stuck at mu=0
         self.rbf_mu = np.array([-4.0, -2.0, 0.0, 2.0, 5.0], dtype=np.float64)
         self.rbf_sigma = np.array([4.0, 1.5, 1.5, 1.5, 2.5], dtype=np.float64)

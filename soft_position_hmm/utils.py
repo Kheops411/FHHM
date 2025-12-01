@@ -51,14 +51,21 @@ def lattice_delta_to_index(dx: int, dy: int, width_x: int = 15) -> int:
 
 # --- Data Parsing & Ordering ---
 
+# Updated DTYPE to match usage. 
+# Note: 'channel' stores the Hand Index (0=RH, 1=LH) from column 6.
 NOTE_DTYPE = np.dtype([
-    ('original_idx', np.int32), ('ontime', np.float64), ('offtime', np.float64),
-    ('pitch_str', 'U10'), ('pitch', np.int32), ('velocity', np.int32),
-    ('channel', np.int32), ('finger_str', 'U20'), ('finger', np.int32)
+    ('original_idx', np.int32), 
+    ('ontime', np.float64), 
+    ('offtime', np.float64),
+    ('pitch_str', 'U10'), 
+    ('pitch', np.int32), 
+    ('velocity', np.int32),
+    ('channel', np.int32), 
+    ('finger_str', 'U20'), 
+    ('finger', np.int32)
 ])
 
 SITCH_REGEX = re.compile(r'([A-G])([#b+-]*)([0-9])')
-COMMENT_REGEX = re.compile(r'//.*|(?<!\S)#.*')
 
 def sitch_to_pitch(sitch: str) -> int:
     if sitch in ("R", "rest"): return -1
@@ -76,70 +83,93 @@ def sitch_to_pitch(sitch: str) -> int:
 
 def clean_finger_str(finger_str: str) -> int:
     """
-    Parses a finger string (e.g., "4_1", "-3") into a single integer.
-    This replicates the C++ `GetKeyPressFingerNum` and `ConvertFingerNumberToInt` logic.
+    Parses a finger string (e.g., "4_1", "-3", "-5_-1") into a single integer.
+    Handles substitution by taking the starting finger (first part).
     """
     try:
-        # Take the part before any substitution marking
+        # Take the part before any substitution marking (underscore)
+        # "4_1" -> "4", "-5_-1" -> "-5"
         cleaned_str = finger_str.split('_')[0]
         finger_val = int(cleaned_str)
-        # Clamp the values to the valid range [-5, 5], excluding 0.
+        
+        # Clamp/Check validity: [-5, 5] excluding 0
         if 0 < finger_val <= 5:
             return finger_val
         if -5 <= finger_val < 0:
             return finger_val
     except (ValueError, IndexError):
-        pass # Fall through to return 0 if parsing fails
+        pass # Return 0 for invalid parsing
     return 0 # Default/invalid
-
 
 def load_pig_file(filepath: str) -> np.ndarray:
     """
-    Robust, stream-like parser for PIG files.
+    Robust line-by-line parser for PIG files.
+    Enforces 8 columns per line to prevent data shifting.
+    
+    Columns:
+    0: ID
+    1: Onset
+    2: Offset
+    3: Note Name
+    4: Onset Velocity
+    5: Offset Velocity (Ignored)
+    6: Hand Index (0=RH, 1=LH) -> stored in 'channel'
+    7: Finger Index (can include substitution e.g. "1_2")
     """
+    raw_notes = []
+    
     with open(filepath, 'r') as f:
-        content = f.read()
+        line_num = 0
+        for line in f:
+            line_num += 1
+            # 1. Strip comments and whitespace
+            content = line.partition('//')[0].strip()
+            
+            if not content:
+                continue
+                
+            tokens = content.split()
+            
+            # 2. Strict Structure Validation
+            if len(tokens) != 8:
+                raise ValueError(f"Line {line_num} malformed: expected 8 columns, got {len(tokens)}. Content: '{content}'")
+            
+            try:
+                # 3. Parse fields
+                original_idx = int(tokens[0])
+                ontime       = float(tokens[1])
+                offtime      = float(tokens[2])
+                pitch_str    = tokens[3]
+                pitch        = sitch_to_pitch(pitch_str)
+                velocity     = int(tokens[4])
+                # token[5] is offset velocity, ignored.
+                hand_idx     = int(tokens[6]) 
+                finger_str   = tokens[7]
+                finger       = clean_finger_str(finger_str)
+                
+                raw_notes.append((
+                    original_idx, ontime, offtime, pitch_str, pitch, 
+                    velocity, hand_idx, finger_str, finger
+                ))
+                
+            except Exception as e:
+                raise ValueError(f"Parsing error on line {line_num}: {e}")
 
-    clean_content = COMMENT_REGEX.sub('', content)
-    tokens = clean_content.split()
-    num_tokens = len(tokens)
-
-    num_notes = num_tokens // 8
-
-    notes = np.zeros(num_notes, dtype=NOTE_DTYPE)
-    if num_notes == 0:
-        return notes
-
-    try:
-        for i in range(num_notes):
-            base = i * 8
-            notes[i]['original_idx'] = int(tokens[base])
-            notes[i]['ontime']       = float(tokens[base + 1])
-            notes[i]['offtime']      = float(tokens[base + 2])
-            pitch_str = tokens[base + 3]
-            notes[i]['pitch_str']    = pitch_str
-            notes[i]['pitch']        = sitch_to_pitch(pitch_str)
-            notes[i]['velocity']     = int(tokens[base + 4]) # onvel
-            notes[i]['channel']      = int(tokens[base + 6])
-            finger_str = tokens[base + 7]
-            notes[i]['finger_str']   = finger_str
-            notes[i]['finger']       = clean_finger_str(finger_str)
-
-    except (ValueError, IndexError) as e:
-        raise ValueError(f"Parsing error at note index {i} (token base {base}): {e}")
-
-    return notes
+    # Convert to structured numpy array
+    if not raw_notes:
+        return np.zeros(0, dtype=NOTE_DTYPE)
+        
+    return np.array(raw_notes, dtype=NOTE_DTYPE)
 
 
 def apply_time_dep_pitch_order(notes: np.ndarray, time_threshold: float = 0.03) -> np.ndarray:
     """
-    Groups notes by onset (within 0.03s tolerance) and sorts them by Pitch ASCENDING (Low to High).
-    This matches the C++ logic: sort by (-pitch) descending => sort by (+pitch) ascending.
+    Groups notes by onset (within 0.03s tolerance) and sorts them by Pitch ASCENDING.
     """
     if len(notes) == 0:
         return notes
 
-    # Tri global par temps pour faciliter le clustering linéaire
+    # Global sort by time
     notes = np.sort(notes, order=['ontime'], kind='stable')
 
     reordered_notes = []
@@ -148,13 +178,14 @@ def apply_time_dep_pitch_order(notes: np.ndarray, time_threshold: float = 0.03) 
     while i < len(notes):
         cluster_indices = [i]
         j = i + 1
-        # Clustering temporel (notes simultanées)
+        # Cluster simultaneous notes
         while j < len(notes) and abs(notes[j]['ontime'] - notes[j-1]['ontime']) < time_threshold:
             cluster_indices.append(j)
             j += 1
 
         cluster_notes = notes[cluster_indices]
 
+        # Sort by pitch ASCENDING (Low -> High)
         sorted_indices = np.argsort(cluster_notes['pitch'], kind='stable')
 
         reordered_notes.extend(cluster_notes[sorted_indices])
@@ -165,7 +196,9 @@ def apply_time_dep_pitch_order(notes: np.ndarray, time_threshold: float = 0.03) 
 
 def filter_notes_by_hand(notes: np.ndarray, hand: int) -> np.ndarray:
     """
-    Filters notes based on the C++ `SelectHandByFingerNum` logic.
+    Filters notes based on the finger sign.
+    Hand 0 (RH) -> Finger > 0
+    Hand 1 (LH) -> Finger < 0
     """
     if notes.shape[0] == 0:
         return np.array([], dtype=notes.dtype)

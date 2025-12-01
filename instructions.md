@@ -1,345 +1,483 @@
-# Project Context: Soft-Position HMM for Piano Fingering
+# Introduction
 
-You are entering a project designed to solve a complex biomechanical problem: **predicting optimal piano fingering** (which finger plays which note) given a musical score.
+The program in `soft_position_hmm` implements a probabilistic model (2nd‑order HMM) to predict or learn piano fingering from sequences of MIDI notes.
 
-### The Core Problem
-Standard Hidden Markov Models (HMMs) fail at piano fingering because they only track the finger (1-5). They ignore the **hand's position** on the keyboard.
-*   *Example:* Playing a generic "C" with the thumb (1) is easy. Playing a high "C" with the thumb while the hand is anchored two octaves lower is physically impossible.
+**Summary of roles:**
 
-### The Solution: "Soft-Position" Architecture
-This project implements a hybrid HMM that tracks a **dual hidden state**:
-1.  **The Finger ($f$):** 1 (Thumb) to 5 (Pinky).
-2.  **The Anchor ($k$):** The center position of the hand relative to the note.
+* **core.py**: defines the basic biomechanical model.  
+  * Numba functions to compute:  
+    * an emission score (finger ↔ pitch interval compatibility),  
+    * an inertia cost (difficulty of hand movement).  
+  * Model parameters (RBF for each finger, temporal inertia).
 
-**How it works:**
-*   **Emission (Geometry):** Instead of a hard matrix, we use Gaussian distributions (`core.py`). We calculate the probability of a finger reaching a note based on where the hand is anchored.
-*   **Transition (Physics):** We model the "cost" of moving the hand (Inertia) vs. stretching the fingers (Elasticity).
-*   **Inference:** We use the Viterbi algorithm (`inference.py`) optimized with **Numba** for high performance.
+* **structural.py**: defines the structure of the Viterbi lattice (log‑probabilities, backpointers) for optimal path search in the HMM.
 
-### Your Mission
-The codebase (`soft_position_hmm/`) has been written based on theoretical specifications but **has never been executed**. It is currently a "black box" of unverified math.
+* **utils.py**: utility functions.  
+  * Conversion MIDI pitch → keyboard position.  
+  * Strict parsing of annotated files (PIG).  
+  * Temporal sorting of notes and filtering by hand.
 
-**Why strict testing is required:**
-Because this is a probabilistic system (EM Algorithm), **bugs do not always cause crashes**. They often result in "silent failures" where the model converges to mathematical garbage or produces physically impossible fingerings (e.g., jumping the hand 10 times a second).
+* **inference.py**: core of the HMM algorithm.  
+  * Forward pass (constrained or free) that fills the lattice by combining emission, inertia, transitions, and smoothing.  
+  * Backtracking to extract the optimal sequence of fingers and anchors.
 
-**You cannot "guess" your way through debugging this.** You must verify the mathematical integrity of each component before the system can be trained.
+* **training.py**: EM loop for parameter learning.  
+  * E‑step: optimal anchoring constrained by true fingers.  
+  * M‑step: update of RBF parameters and agility matrix (transition probabilities between fingers).
 
-# Technical Specification: Soft-Position HMM (Implementation v1.0)
+* **interface.py**: high‑level user API.  
+  * Takes a sequence of notes and produces predictive fingering by calling forward pass + backtracking.
 
-**Architecture Overview:**
-Hybrid HMM combining a **Trigram (2nd-Order) chain** for fingers and a **1st-Order chain** for hand position.
-*   **Geometric Engine:** Parametric Gaussian Emission ($\mu, \sigma$).
-*   **Training Method:** Viterbi Training (Hard EM) with Analytical MLE updates.
-*   **Topology:** Sequential processing with Soft Constraints for chords.
+**Overview of operation:**
 
-#### 1. State Space Structure
+1. Notes are read, cleaned, ordered, and filtered by hand.  
+2. The model evaluates for each note the likelihood of using a given finger and hand position.  
+3. The HMM explores all possible combinations and selects the most probable trajectory (Viterbi).  
+4. In training mode, this trajectory is used to re‑estimate parameters (EM).  
+5. In prediction mode, the optimal finger sequence is retrieved.  
 
-The hidden state $S_t$ at time $t$ describes the current finger, the previous finger, and the hand position:
-
-$$ S_t = (f_{t-1}, f_t, k_t) $$
-
-**Definitions:**
-*   **$f_{t-1}, f_t \in \{0..4\}$**: The finger indices (mapped to 1..5). We store $f_{t-1}$ to enable trigram transitions ($f_{t-2} \to f_{t-1} \to f_t$).
-*   **$k_t \in \{0..24\}$**: A discrete index representing the "center of the hand" (Anchor).
-    *   **Anchor Grid ($c_k$):** Integer range `[-12, -11, ..., 0, ..., +11, +12]` (semitones relative to the pitch).
-    *   **Resolution:** 1 semitone.
-
-**Viterbi Trellis Dimensions:**
-*   State size per time step: $5 \times 5 \times 25 = 625$ logical states.
-*   Transition complexity: Each state calculation considers $(f_{t-2}, k_{t-1})$ from the previous timestep.
-
-#### 2. Emission Score (Geometric Compatibility)
-
-Quantifies the probability of a finger $f_t$ playing a pitch $p_t$ given a hand position $c_{k_t}$, assuming a Gaussian distribution of finger reach.
-
-**Calculation:**
-For an observation $p_t$ and a candidate state $(f_t, k_t)$:
-
-1.  **Calculate Delta:** $\delta = p_t - (p_t + c_{k_t}) = -c_{k_t}$ (Relative offset from hand center).
-    *   *Note in code:* Effectively $\delta_{pitch} = -ANCHORS[k]$.
-2.  **Gaussian Density:**
-    $$ z = \exp\left( -\frac{(\delta - \mu_{f_t})^2}{2\sigma_{f_t}^2} \right) $$
-    *   $\mu_{f_t}$: Learned mean position for finger $f_t$.
-    *   $\sigma_{f_t}$: Learned standard deviation (reach width) for finger $f_t$ (clamped $\ge 1.0$).
-3.  **Log-Probability:**
-    $$ E_{emit} = \ln(z + \epsilon) $$
-
-#### 3. Unified Transition Model
-
-| Symbole | Variable Code | Définition |
-| :--- | :--- | :--- |
-| $p_t$ | `notes_pitch[t]` | Hauteur MIDI de la note à l'instant $t$. |
-| $c_{k_t}$ | `ANCHORS[k_curr]` | Valeur de l'ancre (décalage relatif) choisie à l'instant $t$. |
-| $H_t$ | `hand_pos_curr` | Position absolue de la main ($p_t + c_{k_t}$). |
-
-The transition score aggregates digital agility, dynamic inertia (time-dependent), and static smoothing.
-
-$$ T(S_{t-1} \to S_t) = T_{agile} - T_{inertia} - T_{smooth} $$
-
-**3.1 Digital Agility ($T_{agile}$)**
-Look-up in a trigram tensor $A$ of shape $5 \times 5 \times 5$:
-$$ T_{agile} = A[f_{t-2}, f_{t-1}, f_t] $$
-
-**3.2 Dynamic Inertia ($T_{inertia}$)**
-Models the biomechanical cost of moving the hand base, modulated by the inter-onset interval ($\Delta t$).
-
-$$ T_{inertia} = \lambda(\Delta t) \cdot \Delta d_{phys} \cdot w_{inertia} $$
-
-*   Let $H_t = p_t + c_{k_t}$ be the absolute position of the hand center (MIDI pitch + Anchor offset).
-*   **$\Delta d_{phys} = |H_t - H_{t-1}| = |(p_t + c_{k_t}) - (p_{t-1} + c_{k_{t-1}})|$**: The absolute physical distance traveled by the hand base in semitones.
-*   **Stiffness Function $\lambda(\Delta t)$:**
-    $$ \lambda(\Delta t) = \frac{1}{1 + e^{\text{slope} \cdot (\Delta t - \text{center})}} $$
-    *   Legato ($\Delta t \to 0 \implies \lambda \to 1$): Movement is costly.
-    *   Rest ($\Delta t \gg 0 \implies \lambda \to 0$): Movement is cheap.
-
-**3.3 Static Smoothing ($T_{smooth}$)**
-A time-independent regularization term to prevent hand jitter.
-
-$$ T_{smooth} = |c_{k_t} - c_{k_{t-1}}| \cdot w_{smooth} $$
-**Definitions:**
-*   $|c_{k_t} - c_{k_{t-1}}|$: The **relative anchor change** (change in hand posture/offset), independent of the pitch played. This term penalizes shifting the "center of the hand" relative to the fingers, encouraging stability in the internal hand configuration.
+---  
 
 
-#### 4. Topology & Chord Handling
+# Technical Specification — Soft-Position HMM
 
-**4.1 Sequential ordering**
-Input notes are strictly ordered by time ($t_{on}$), then by pitch ($p$) ascending.
+## 1. Model and Lattice Structure
 
-**4.2 Soft Constraints for Chords**
-Notes with $\Delta t \approx 0$ are treated sequentially.
-*   **Mechanism:** The Inertia function generates a maximal stiffness $\lambda \approx 1.0$.
-*   **Effect:** Any change in hand position ($k_t \neq k_{t-1}$) incurs a maximal penalty ($1.0 \times \text{dist} \times w_{inertia}$).
-*   **Result:** The Viterbi path is mathematically forced to maintain the same anchor $k$ for all notes in a chord, unless the emission gain of moving is astronomically high (physically impossible intervals).
+The model is a 2nd-order HMM for fingers and a 1st-order HMM for anchors.
+For each time step ($t$), the lattice contains all combinations of:
 
-#### 5. Training Strategy (Viterbi Training / Hard EM)
+*   current finger
+    $$ f_t \in \{0,1,2,3,4\}, $$
+*   previous finger
+    $$ f_{t-1} \in \{0,1,2,3,4\}, $$
+*   current anchor
+    $$ k_t \in \{0,\dots,24\}. $$
 
-The model parameters ($\mu, \sigma$) are learned via Iterative Viterbi Training.
+The lattice dimensions are:
+$$ T \times 5 \times 5 \times 25. $$
 
-**5.1 Biomechanical Initialization**
-Parameters are initialized with fixed scalar values representing a relaxed right hand:
-*   $\mu_{init}$: `[-4.0, -2.0, 0.0, 2.0, 5.0]` (Thumb left, Pinky right).
-*   $\sigma_{init}$: `[4.0, 1.5, 1.5, 1.5, 2.5]` (Thumb/Pinky more flexible).
-
-**5.2 Learning Loop**
-1.  **E-Step (Alignment):** Run **Constrained Forward Pass** on training data.
-    *   $f_t$ is fixed to the ground truth annotation.
-    *   $k_t$ is inferred to find the optimal hand position sequence.
-2.  **M-Step (Analytical Update):**
-    *   Collect all observed relative distances $\delta$ for each finger $f$.
-    *   Update $\mu_f = \text{Mean}(\delta_f)$.
-    *   Update $\sigma_f = \text{Std}(\delta_f)$ (with floor at 1.0).
-
-**Required Data Structures:**
-
-*   **Global Constants:**
-    *   `ANCHORS`: `int32` array `[-12..+12]`.
-*   **Model Parameters (`SoftPositionModel`):**
-    *   `rbf_mu`: `float64` array `[5]`.
-    *   `rbf_sigma`: `float64` array `[5]`.
-    *   `inertia_weight`: `float`.
-    *   `time_slope`, `time_center`: `float` (Sigmoid params).
-*   **Hyperparameters:**
-    *   `agility_matrix`: `float64` tensor `[5, 5, 5]` (Log-probabilities).
-    *   `smoothing_weight`: `float`.
-*   **Runtime (`ViterbiLattice`):**
-    *   `log_probs`: `[Time, 5, 5, 25]`.
-    *   `backpointers`: `[Time, 5, 5, 25, 3]`.
-
-
-# Technical Validation Protocol (Strict Implementation)
-
-**Context:** You are initializing the `soft_position_hmm` module.
-**Developer Profile Constraints:**
-1.  **No improvisation:** Use the exact code snippets provided below for data generation.
-2.  **No assumptions:** Verify every component in isolation before running integration tests.
-3.  **Mandatory Debugging:** If a test fails, you must log the shapes (`.shape`) and types (`.dtype`) of arrays involved.
-
-**Execution Order:** Phase 0 -> Phase 1 -> Phase 2. **Do not skip steps.**
+Transitions also require ($f_{t-2}$) and the previous anchor ($k_{t-1}$).
+The exact lattice structure is defined in `structural.py` (log-probability matrices, backpointers, storage of two successive fingers, etc.).
 
 ---
 
-## Phase 0: Low-Level Component Validation (Unit Tests)
+## 2. Emission Model
 
-**File:** `tests_validation/test_00_components.py`
-**Goal:** Validate data parsing regex and Numba JIT compilation before any model logic is touched.
+**Module:** `core.compute_emission_score`
 
-### 0.1 Parser Robustness
-**Instruction:** Copy this test function exactly. It verifies that `load_pig_file` correctly handles comments and garbage data, preventing silent failures later.
+For a time step ($t$), emission depends on the finger ($f_t$) and the anchor ($k_t$), applied to the MIDI pitch note ($p_t$).
 
-```python
-def test_parser_logic():
-    from soft_position_hmm.utils import clean_finger_str, sitch_to_pitch
-    
-    # 1. Test Finger Cleaning
-    assert clean_finger_str("3") == 3, "Failed simple finger"
-    assert clean_finger_str("4_1") == 4, "Failed substitution handling"
-    assert clean_finger_str("-2") == -2, "Failed left hand negative"
-    assert clean_finger_str("x") == 0, "Failed garbage input"
+### 2.1 Definition of Delta ($\delta_t$)
 
-    # 2. Test Pitch Parsing
-    assert sitch_to_pitch("C4") == 60, "C4 must be 60"
-    assert sitch_to_pitch("A#0") == 22, "A#0 calculation wrong"
-    try:
-        sitch_to_pitch("H5")
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("Invalid pitch string did not raise ValueError")
-    
-    print("[PASS] Parser Logic")
+The code defines:
+$$ \delta_t = -\mathrm{ANCHORS}[k_t], $$
+where `ANCHORS` is a constant array of 25 integers covering the range $[-12,+12]$ semitones.
 
-if __name__ == "__main__":
-    test_parser_logic()
-```
+### 2.2 Biomechanical Parameters (per finger)
 
-### 0.2 Numba JIT Math
-**Instruction:** Validate that `core.py` functions compile and return floats, not NaNs.
+Each finger ($f$) possesses:
 
-```python
-def test_numba_math():
-    import numpy as np
-    from soft_position_hmm.core import compute_emission_score, compute_inertia_cost
-    
-    # Dummy data
-    mu = np.array([0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float64)
-    sigma = np.array([1.0, 1.0, 1.0, 1.0, 1.0], dtype=np.float64)
-    
-    # 1. Test Emission
-    # Finger 0, Delta 0 -> Should be high probability (close to 0 log-prob)
-    score = compute_emission_score(0, 0, mu, sigma)
-    assert isinstance(score, float), "Emission must return float"
-    assert score < 0, "Log prob must be negative"
-    assert score > -1.0, "Perfect match should have high score"
+*   a mean ($\mu_f$),
+*   a standard deviation ($\sigma_f$).
 
-    # 2. Test Inertia
-    cost = compute_inertia_cost(physical_distance=12.0, dt=0.05, slope=10.0, center=0.2, weight=1.0)
-    assert cost > 0, "Inertia cost must be positive"
-    
-    print("[PASS] Numba Math")
+These parameters are updated during training.
 
-if __name__ == "__main__":
-    test_numba_math()
-```
+### 2.3 Standard Deviation Clamp (Inference)
+
+In inference, the code forces:
+$$ \hat\sigma_f = \max(\sigma_f, 1.0). $$
+
+### 2.4 Exact Formula
+
+The emission score is:
+$$ \mathrm{emit}(t,f_t,k_t) = -\log(\hat\sigma_{f_t}) - \tfrac12\log(2\pi) - \frac{(\delta_t - \mu_{f_t})^2}{2\hat\sigma_{f_t}^2}. $$
 
 ---
 
-## Phase 1: Integration & Logic (Functional Tests)
+## 3. Transition Model
 
-**File:** `tests_validation/test_01_integration.py`
+The transition score between $(f_{t-2},f_{t-1},k_{t-1})$ and $(f_{t-1},f_t,k_t)$ is:
 
-### 1.1 Cold Start Sanity Check (With Strict Data Generation)
-**Instruction:** Do not create your own data. Use this `generate_c_major` function to prevent array shape errors.
+$$ \mathrm{trans} = \mathrm{agility} - \mathrm{inertia} - \mathrm{smoothing}. $$
 
+All components below correspond exactly to the provided files.
+
+---
+
+### 3.1 Agility: Finger Trigram
+
+The model contains a tensor:
+$$ A \in \mathbb{R}^{5\times 5\times 5}, $$
+storing the **log-probabilities**:
+
+$$ \mathrm{agility} = A[f_{t-2}, f_{t-1}, f_t]. $$
+
+If untrained, `A` = 0 for all entries (uniform prior in log-space).
+
+---
+
+### 3.2 Inertia: Hand Center Displacement Cost
+
+**Modules:** `core.compute_inertia_cost` and usage in `inference.py`
+
+The formula used in inference is **strictly scalar in semitones**; no conversion to 2D keyboard coordinates is performed.
+
+#### 3.2.1 Definition of Hand Center
+
+For a MIDI pitch note ($p_t$) and an anchor ($k_t$), the hand center is:
+$$ \mathrm{center}_t = p_t + \mathrm{ANCHORS}[k_t]. $$
+Both terms are integers (semitones).
+
+#### 3.2.2 Physical Distance Used
+
+The distance used in inertia is:
+$$ d_{\text{phys}} = |\mathrm{center}_t - \mathrm{center}_{t-1}|. $$
+
+It is a **1D distance in semitones**, in accordance with the code:
+
+```python
+hand_pos_prev = notes_pitch[t-1] + ANCHORS[k_prev]
+hand_pos_curr = notes_pitch[t]   + ANCHORS[k_curr]
+dist = np.abs(hand_pos_curr - hand_pos_prev)
+```
+
+#### 3.2.3 Simultaneity Constraint (dt < 1e-4)
+
+If notes are quasi-simultaneous:
+
+*   If ($d_{\text{phys}} > 10^{-4}$):
+    $$ \mathrm{inertia} = +\infty. $$
+*   Otherwise:
+    $$ \mathrm{inertia} = 0. $$
+
+#### 3.2.3 Standard Case (dt ≥ 1e-4)
+
+The code applies a sigmoidal stiffness factor:
+
+$$ \lambda(dt) = \frac{1}{1 + \exp(\mathrm{slope}\cdot(dt - \mathrm{center}))}. $$
+
+Final cost:
+$$ \mathrm{inertia} = \lambda(dt) \cdot d_{\text{phys}} \cdot w_{\text{inertia}}. $$
+
+---
+
+### 3.3 Smoothing: Anchor Change
+
+Smoothing penalizes anchor variation between two notes:
+
+$$ \mathrm{smoothing} = |\mathrm{ANCHORS}[k_t] - \mathrm{ANCHORS}[k_{t-1}]|\cdot w_{\mathrm{smooth}}. $$
+
+---
+
+## 4. Training (Hard EM — Viterbi Training)
+
+**Module:** `training.py`
+
+Learning is performed entirely in log-probability space, with updates to biomechanical parameters and the agility tensor.
+
+---
+
+### 4.1 E-Step: Constrained Inference (Anchors Only)
+
+The actual fingering provided in the data is imposed:
+
+*   Fingers ($f_t$) are *fixed* to the ground truth.
+*   Only anchors ($k_t$) are optimized.
+*   The modified forward pass is implemented in: `run_constrained_forward_pass`.
+
+---
+
+### 4.2 M-Step: Parameter Updates
+
+#### A. Emission Parameters (RBF per finger)
+
+From the observed $\delta_t$ (defined by $-\mathrm{ANCHORS}[k_t]$):
+
+$$ \mu_f \leftarrow \text{empirical mean}, \qquad \sigma_f \leftarrow \max(\text{empirical std dev}, 0.5). $$
+
+The **0.5** threshold is specific to training (different from the 1.0 threshold used in inference).
+
+#### B. Agility Tensor (Trigram)
+
+1.  Counting transitions:
+    $$ C(f_{t-2},f_{t-1},f_t). $$
+
+2.  Normalization for each pair $(f_{t-2},f_{t-1})$:
+    $$ P = C / \sum_{f_t} C. $$
+
+3.  Empty rows:
+    if $\sum_{f_t} C = 0$, then
+    $$ P(f_t) = 1/5. $$
+
+4.  Conversion to log-space:
+    $$ A = \log(P + 10^{-12}). $$
+
+---
+
+## 5. Input Data Pre-processing
+
+**Module:** `utils.py`
+
+### 5.1 PIG Parsing
+
+Files contain exactly 8 columns.
+Fingers can be written as strings such as `"4_1"`; the code correctly extracts the main integer.
+
+### 5.2 Hand Separation
+
+*   Right Hand: finger > 0
+*   Left Hand: finger < 0
+
+Lines where finger is 0 or invalid are rejected.
+
+### 5.3 Time Sorting and Simultaneity Handling
+
+1.  Primary sort by onset.
+2.  Simultaneity cluster detection:
+    two notes belong to the same cluster if the onset difference is < 0.03 s.
+3.  Secondary sort within each cluster by ascending pitch.
+
+The internal cluster order directly influences the correct application of the simultaneity inertia constraint.
+
+---
+
+## 6. Model Result
+
+Inference (module `interface.py`):
+
+1.  constructs the full lattice ($T \times 5 \times 5 \times 25$),
+2.  fills scores via emission + transition accumulation,
+3.  performs backtracking (defined in `structural.py`),
+4.  returns the optimal sequence of fingers and anchors (or only fingers if requested).
+
+
+
+# Instructions
+
+**SUBJECT: STRICT PROTOCOL FOR REFACTORING AND DEBUGGING PIANO FINGERING HMM**
+
+You are tasked with refactoring a Python-based Hidden Markov Model (HMM) system. The current codebase contains critical mathematical and logical flaws.
+
+**STRICT OPERATIONAL RULES:**
+1.  **Do NOT rely on your intuition.** You do not know the domain (music/piano). Follow the mathematical instructions exactly.
+2.  **NO "Patching".** Do not hardcode values to satisfy a test case (e.g., `if value == 5: return expected_result`). You must fix the underlying logic/equation.
+3.  **NO "Magic Numbers" inside functions.** Define constants at the top of the module or in the class `__init__`.
+4.  **NO `if/else` spaghetti for math.** If I ask for a matrix initialization, do not write a loop with conditionals. Use Numpy vectorization.
+5.  **MANDATORY LOGGING:** Before *any* action (editing a file, running a script, even fixing a typo), you must append an entry to a file named `CHANGELOG_DEV.md` at the project root.
+    *   Format: `[TIMESTAMP] [FILE] [ACTION] [OBSERVATION]`
+    *   Example: `[10:05] core.py - Added clip() to inertia - Result: Integers are now bounded.`
+6.  **EXECUTION:** For every task, you must create a dedicated test script (`test_task_N.py`), run it, and paste the output into `CHANGELOG_DEV.md`. If the script fails, you do not proceed.
+
+---
+
+### TASK 0: SETUP
+1.  Create `CHANGELOG_DEV.md` at the root.
+2.  Log the start of the session.
+
+---
+
+### TASK 1: FIX AGILITY MATRIX INITIALIZATION
+**Context:** Currently, `agility_matrix` is initialized to zeros. In log-space, `log(0) = -inf`, which breaks the HMM (all probabilities become zero).
+**Target File:** `training.py`
+
+**Instructions:**
+1.  Locate `SoftPositionTrainer.__init__`.
+2.  Replace `np.zeros(...)` with a uniform distribution: `np.full((5, 5, 5), 1.0 / 125, dtype=np.float64)`.
+3.  In `_update_agility_parameters`:
+    *   Before calculating probabilities, apply Laplace Smoothing: add `1e-3` to `counts` to ensure no zero-counts exist.
+    *   Calculate `log_probs`. Ensure you use `np.log(probs + 1e-12)` (epsilon) as a safety net.
+
+**Validation Script (`test_task_1.py`):**
 ```python
 import numpy as np
-from soft_position_hmm.utils import NOTE_DTYPE
-from soft_position_hmm.core import SoftPositionModel
+from soft_position_hmm.training import SoftPositionTrainer
+
+trainer = SoftPositionTrainer()
+# Check initialization
+print(f"Init Mean: {np.mean(trainer.agility_matrix)}")
+assert np.all(trainer.agility_matrix > 0), "Matrix must be positive before log"
+
+# Check Update Logic
+counts = np.zeros((5,5,5)) # Empty counts
+trainer._update_agility_parameters(counts)
+print(f"Log Agility Max: {np.max(trainer.agility_matrix)}")
+print(f"Log Agility Min: {np.min(trainer.agility_matrix)}")
+
+# FAILURE CONDITION: If min is -inf or nan.
+if not np.isfinite(trainer.agility_matrix).all():
+    raise ValueError("Agility matrix contains Inf or NaN!")
+print("TASK 1 SUCCESS")
+```
+
+---
+
+### TASK 2: FIX CHORD HANDLING AND TIMING
+**Context:** The condition `dt < 1e-4` is too strict for real-world data. It causes "teleportation" errors where infinite cost is applied to chords.
+**Target File:** `core.py` (logic) and `inference.py` (implementation)
+
+**Instructions:**
+1.  In `core.py`, modify `compute_inertia_cost`:
+    *   Change the logic to: **If `dt` is less than `0.03` (30ms), the inertia cost is `0.0`**, regardless of physical distance.
+    *   Do **NOT** simply change the `1e-4` threshold. You must add the explicit check: `if dt < 0.03: return 0.0`.
+    *   Remove the `return np.inf` logic for small time steps. Inertia should simply be zero for chords.
+
+**Validation Script (`test_task_2.py`):**
+```python
+from soft_position_hmm.core import compute_inertia_cost
+
+# Scenario: Two notes in a chord (dt=0.001), distance is 5 semitones
+cost_chord = compute_inertia_cost(physical_distance=5.0, dt=0.001, slope=10.0, center=0.2, weight=1.0)
+print(f"Cost Chord: {cost_chord}")
+
+# Scenario: Fast scale (dt=0.1), distance 5
+cost_scale = compute_inertia_cost(physical_distance=5.0, dt=0.1, slope=10.0, center=0.2, weight=1.0)
+print(f"Cost Scale: {cost_scale}")
+
+if cost_chord != 0.0:
+    raise ValueError("Chords (dt < 0.03) must have 0 inertia cost.")
+if cost_scale == 0.0:
+    raise ValueError("Scales must have non-zero inertia.")
+print("TASK 2 SUCCESS")
+```
+
+---
+
+### TASK 3: PARSING ROBUSTNESS
+**Context:** Currently, if a finger annotation is invalid/unknown, the parser returns `0` or drops the note. This corrupts the rhythm.
+**Target File:** `utils.py` and `inference.py`
+
+**Instructions:**
+1.  In `utils.py`:
+    *   Define a global constant: `FINGER_UNKNOWN = -999`.
+    *   Modify `clean_finger_str`: If parsing fails or input is invalid, return `FINGER_UNKNOWN` instead of `0`.
+    *   Modify `filter_notes_by_hand`: **Remove this filtering logic entirely.** Do not filter notes based on finger values. We need ALL notes to maintain correct `dt`.
+2.  In `inference.py`, inside `run_constrained_forward_pass`:
+    *   Locate where `f_curr` and `f_prev` are retrieved from `true_fingers`.
+    *   Add a condition: If `true_fingers[t] == -999`, do **NOT** force the path. Allow the loop to explore all `N_FINGERS` (treat it as an unconstrained hidden state for that step).
+    *   *Implementation Hint:* You likely need an `if/else` block: `if true_fingers[t] != -999: # enforce constraint ... else: # standard forward pass logic ...`
+
+**Validation Script (`test_task_3.py`):**
+```python
+import numpy as np
+from soft_position_hmm.utils import clean_finger_str, FINGER_UNKNOWN, filter_notes_by_hand
+from soft_position_hmm.structural import NOTE_DTYPE
+
+# 1. Test Parser
+res = clean_finger_str("invalid")
+if res != FINGER_UNKNOWN:
+    raise ValueError(f"Expected {FINGER_UNKNOWN}, got {res}")
+
+# 2. Test Filter
+# Create a dummy note array with an unknown finger
+dummy_notes = np.zeros(1, dtype=NOTE_DTYPE)
+dummy_notes[0]['finger'] = FINGER_UNKNOWN
+filtered = filter_notes_by_hand(dummy_notes, 0)
+
+if len(filtered) == 0:
+    raise ValueError("filter_notes_by_hand deleted the unknown note! It must persist.")
+print("TASK 3 SUCCESS")
+```
+
+---
+
+### TASK 4: GEOMETRY UPDATE (EUCLIDEAN DISTANCE)
+**Context:** The system uses `delta_pitch` (1D semitones) for inertia. It needs 2D physical distance (keys).
+**Target File:** `inference.py`
+
+**Instructions:**
+1.  Import `PITCH_TO_KEYPOS_LUT` from `.utils`.
+2.  In `run_forward_pass` and `run_constrained_forward_pass`:
+    *   Locate the inertia calculation loop.
+    *   Currently, it calculates `dist = abs(hand_pos_curr - hand_pos_prev)`. **This is wrong.**
+    *   You must calculate the **2D Euclidean distance**:
+        *   Get coordinates for `hand_pos_prev` (which is a pitch value) using the LUT.
+        *   Get coordinates for `hand_pos_curr` using the LUT.
+        *   `dx = x2 - x1`, `dy = y2 - y1`
+        *   `dist = sqrt(dx*dx + dy*dy)`
+    *   Pass *this* `dist` to `compute_inertia_cost`.
+    *   *Note:* Ensure you handle array bounds if `hand_pos` falls outside 0-127 (clamp it if necessary before looking up in LUT).
+
+**Validation Script (`test_task_4.py`):**
+*No script provided. Run the existing `inference.py` logic. If it crashes with "IndexError", you forgot to clamp the pitch before LUT lookup. Log the fix.*
+
+---
+
+### TASK 5: INERTIA CLIPPING
+**Context:** Large jumps cause infinite costs which break the math (NaNs).
+**Target File:** `core.py`
+
+**Instructions:**
+1.  In `compute_inertia_cost`:
+    *   After calculating `cost`, apply a clamp/min function.
+    *   `cost = min(cost, 8.0)`
+    *   This ensures that even impossible jumps have a finite probability (exp(-8) is small but not zero).
+
+**Validation Script (`test_task_5.py`):**
+```python
+from soft_position_hmm.core import compute_inertia_cost
+# Scenario: Impossible jump (distance 100), short time
+cost = compute_inertia_cost(100.0, 0.1, 10.0, 0.2, 1.0)
+print(f"Capped Cost: {cost}")
+if cost > 8.0001:
+    raise ValueError("Inertia cost was not capped!")
+print("TASK 5 SUCCESS")
+```
+
+---
+
+### TASK 6: EM STABILITY
+**Context:** Training fails if `sigma` becomes 0 or if parameters oscillate.
+**Target File:** `training.py`
+
+**Instructions:**
+1.  In `_update_emission_parameters`:
+    *   Replace `self.model.rbf_sigma[i] = max(0.5, new_sigma)` with:
+        `self.model.rbf_sigma[i] = max(0.3, new_sigma)` (Allow slightly tighter variance).
+    *   Implement **Momentum** for `mu` updates. Do not simply overwrite `self.model.rbf_mu`.
+        *   Formula: `new_mu = 0.9 * self.model.rbf_mu[i] + 0.1 * computed_mean`
+        *   Then apply: `self.model.rbf_mu[i] = np.clip(new_mu, -12, 12)`
+
+**Validation Script (`test_task_6.py`):**
+```python
+import numpy as np
+from soft_position_hmm.training import SoftPositionTrainer
+
+trainer = SoftPositionTrainer()
+trainer.model.rbf_mu[0] = 5.0
+# Simulate data that would pull mu to -5.0
+deltas = [[-5.0]*10, [], [], [], []]
+
+trainer._update_emission_parameters(deltas)
+new_mu = trainer.model.rbf_mu[0]
+print(f"Old Mu: 5.0, Target: -5.0, New Mu (Momentum): {new_mu}")
+
+# Expected: 0.9*5 + 0.1*(-5) = 4.5 - 0.5 = 4.0
+if not (3.5 < new_mu < 4.5):
+    raise ValueError("Momentum logic is incorrect or missing.")
+print("TASK 6 SUCCESS")
+```
+
+---
+
+### FINAL TASK: LEFT HAND SUPPORT (INTERFACE ONLY)
+**Context:** The model is agnostic, but the user needs positive (RH) and negative (LH) outputs.
+**Target File:** `interface.py`
+
+**Instructions:**
+1.  Modify `predict_fingering` signature to accept a new argument: `hand_sign: int = 1` (default to 1).
+2.  At the very end of the function, before returning `fingers`, multiply the result array:
+    `fingers = fingers * hand_sign`
+3.  Do NOT touch the internal logic of Viterbi.
+
+**Validation Script (`test_task_7.py`):**
+```python
+import numpy as np
 from soft_position_hmm.interface import predict_fingering
-
-def generate_c_major():
-    # 8 notes
-    notes = np.zeros(8, dtype=NOTE_DTYPE)
-    pitches = [60, 62, 64, 65, 67, 69, 71, 72]
-    onsets = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5]
-    
-    for i in range(8):
-        notes[i]['pitch'] = pitches[i]
-        notes[i]['ontime'] = onsets[i]
-        notes[i]['original_idx'] = i
-    return notes
-
-def test_cold_start():
-    notes = generate_c_major()
-    model = SoftPositionModel()
-    
-    # Extract arrays expected by inference
-    p = np.array([n['pitch'] for n in notes], dtype=np.int32)
-    t = np.array([n['ontime'] for n in notes], dtype=np.float64)
-    
-    fingers, anchors = predict_fingering(p, t, model)
-    
-    print(f"Fingers: {fingers}")
-    
-    assert len(fingers) == 8, "Output length mismatch"
-    assert np.all(fingers > 0), "Found invalid finger 0"
-    assert np.all(fingers <= 5), "Found invalid finger > 5"
-    
-    # Heuristic check: C-Major typically uses thumb (1) and avoids repeated fingers
-    assert fingers[0] in [1, 2], "Scale should start with thumb or index"
-    
-    print("[PASS] Cold Start")
-
-if __name__ == "__main__":
-    test_cold_start()
+# Mock objects not needed, just check if the function accepts the arg
+# and if we can visually confirm logic by reading the code or 
+# running a dummy prediction if possible.
+print("TASK 7: Manual Verify - check if 'fingers * hand_sign' is at end of predict_fingering.")
 ```
 
-### 1.2 Chord Constraints Check
-**Instruction:** Verify specifically that simultaneous notes force the same Anchor index.
 
-```python
-def test_chord_constraint():
-    model = SoftPositionModel()
-    # C-Major Chord (C, E, G) at exact same time
-    p = np.array([60, 64, 67], dtype=np.int32)
-    t = np.array([1.0, 1.0, 1.0], dtype=np.float64)
-    
-    fingers, anchors = predict_fingering(p, t, model)
-    
-    print(f"Chord Anchors: {anchors}")
-    
-    assert anchors[0] == anchors[1] == anchors[2], \
-        f"Anchors must be identical for chords. Got {anchors}"
-        
-    print("[PASS] Chord Constraint")
-```
-
----
-
-## Phase 2: Training Mechanics
-
-**File:** `tests_validation/test_02_training.py`
-
-### 2.1 Convergence Monotonicity
-**Instruction:** Do not use the full dataset. Point to `scores/001-1_fingering.txt` only.
-**Requirement:** You must print the delta between iterations.
-
-```python
-def test_convergence():
-    from soft_position_hmm.training import SoftPositionTrainer
-    import numpy as np
-
-    trainer = SoftPositionTrainer()
-    # Run 5 iterations on a single file
-    history = trainer.train(['scores/001-1_fingering.txt'], n_iterations=5)
-    
-    print("Likelihood History:", history)
-    
-    # Strict Monotonicity Check
-    history_arr = np.array(history)
-    diffs = np.diff(history_arr)
-    
-    if np.any(diffs < -1e-5): # Allow tiny float errors
-        print("FAIL: Log-Likelihood decreased!")
-        # Debugging info
-        for i, diff in enumerate(diffs):
-            if diff < 0:
-                print(f"Iter {i}->{i+1} dropped by {diff}")
-        raise ValueError("EM Algorithm failed monotonicity check.")
-        
-    print("[PASS] Convergence")
-
-if __name__ == "__main__":
-    test_convergence()
-```
-
----
-
-**Summary of Deliverables:**
-You are required to implement and run these 3 files:
-1.  `tests_validation/test_00_components.py`
-2.  `tests_validation/test_01_integration.py`
-3.  `tests_validation/test_02_training.py`
-
-**Exit Criteria:**
-Do NOT proceed to full model training until all snippets print `[PASS]`.
-If an error occurs, do not comment out the assertion. Fix the code in `soft_position_hmm`.
+DO NOT FORGET TO APPEND AN ENTRY TO `CHANGELOG_DEV.md` FOR EACH ACTION (editing a file, running a script, even fixing a typo)

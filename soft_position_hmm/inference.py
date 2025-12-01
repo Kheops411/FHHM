@@ -34,8 +34,15 @@ def run_forward_pass(
     # A. Initialization (t = 0)
     for f_curr in range(N_FINGERS):
         for k_curr in range(N_ANCHORS):
-            delta_pitch = -ANCHORS[k_curr]
-            emit = compute_emission_score(delta_pitch, f_curr, rbf_mu, rbf_sigma)
+            note_coord_x = PITCH_TO_KEYPOS_LUT[notes_pitch[0]][0]
+            hand_pos_center_x = note_coord_x + ANCHORS[k_curr]
+            emit = compute_emission_score(
+                note_coord_x,
+                hand_pos_center_x,
+                f_curr,
+                rbf_mu,
+                rbf_sigma
+            )
             # Broadcast to all f_prev states
             for f_prev in range(N_FINGERS):
                 lattice_log_probs[0, f_prev, f_curr, k_curr] = emit
@@ -46,8 +53,15 @@ def run_forward_pass(
         for f_curr in range(N_FINGERS):
             for k_curr in range(N_ANCHORS):
                 # Emission score is constant for this target state
-                delta_pitch = -ANCHORS[k_curr]
-                emit = compute_emission_score(delta_pitch, f_curr, rbf_mu, rbf_sigma)
+                note_coord_x = PITCH_TO_KEYPOS_LUT[notes_pitch[t]][0]
+                hand_pos_center_x = note_coord_x + ANCHORS[k_curr]
+                emit = compute_emission_score(
+                    note_coord_x,
+                    hand_pos_center_x,
+                    f_curr,
+                    rbf_mu,
+                    rbf_sigma
+                )
 
                 for f_prev in range(N_FINGERS):
                     max_prob = -np.inf
@@ -56,24 +70,28 @@ def run_forward_pass(
 
                     for k_prev in range(N_ANCHORS):
                         # Calculate physical distance for inertia
-                        hand_pos_prev = _clip(notes_pitch[t-1] + ANCHORS[k_prev], 0, 127)
-                        hand_pos_curr = _clip(notes_pitch[t] + ANCHORS[k_curr], 0, 127)
+                        note_coord_x_prev = PITCH_TO_KEYPOS_LUT[notes_pitch[t-1]][0]
+                        hand_center_x_prev = note_coord_x_prev + ANCHORS[k_prev]
 
-                        x1, y1 = PITCH_TO_KEYPOS_LUT[hand_pos_prev]
-                        x2, y2 = PITCH_TO_KEYPOS_LUT[hand_pos_curr]
+                        note_coord_x_curr = PITCH_TO_KEYPOS_LUT[notes_pitch[t]][0]
+                        hand_center_x_curr = note_coord_x_curr + ANCHORS[k_curr]
 
-                        dx = float(x2 - x1)
-                        dy = float(y2 - y1)
-                        dist = np.sqrt(dx*dx + dy*dy)
+                        dist = np.abs(hand_center_x_curr - hand_center_x_prev)
 
                         inertia = compute_inertia_cost(dist, dt, inertia_param_slope, inertia_param_center, inertia_weight)
 
                         for f_prev2 in range(N_FINGERS):
+                            # Heuristic bonus for smooth finger transitions
+                            agility_bonus = 0.0
+                            if abs(f_curr - f_prev) <= 1:
+                                agility_bonus = 0.3  # Reward for adjacent fingers
+                            else:
+                                agility_bonus = -0.3 # Penalty for jumps
                             prev_prob = lattice_log_probs[t-1, f_prev2, f_prev, k_prev]
                             agility = agility_matrix[f_prev2, f_prev, f_curr]
 
                             smoothing = np.abs(ANCHORS[k_curr] - ANCHORS[k_prev]) * smoothing_weight
-                            candidate = prev_prob + agility - inertia - smoothing + emit
+                            candidate = prev_prob + agility - inertia - smoothing + emit + agility_bonus
 
                             if candidate > max_prob:
                                 max_prob = candidate
@@ -110,15 +128,29 @@ def run_constrained_forward_pass(
     if true_fingers[0] != FINGER_UNKNOWN:
         f_curr = true_fingers[0] - 1
         for k_curr in range(N_ANCHORS):
-            delta_pitch = -ANCHORS[k_curr]
-            emit = compute_emission_score(delta_pitch, f_curr, rbf_mu, rbf_sigma)
+            note_coord_x = PITCH_TO_KEYPOS_LUT[notes_pitch[0]][0]
+            hand_pos_center_x = note_coord_x + ANCHORS[k_curr]
+            emit = compute_emission_score(
+                note_coord_x,
+                hand_pos_center_x,
+                f_curr,
+                rbf_mu,
+                rbf_sigma
+            )
             for f_prev in range(N_FINGERS):
                 lattice_log_probs[0, f_prev, f_curr, k_curr] = emit
     else:  # Unconstrained init
         for f_curr in range(N_FINGERS):
             for k_curr in range(N_ANCHORS):
-                delta_pitch = -ANCHORS[k_curr]
-                emit = compute_emission_score(delta_pitch, f_curr, rbf_mu, rbf_sigma)
+                note_coord_x = PITCH_TO_KEYPOS_LUT[notes_pitch[0]][0]
+                hand_pos_center_x = note_coord_x + ANCHORS[k_curr]
+                emit = compute_emission_score(
+                    note_coord_x,
+                    hand_pos_center_x,
+                    f_curr,
+                    rbf_mu,
+                    rbf_sigma
+                )
                 for f_prev in range(N_FINGERS):
                     lattice_log_probs[0, f_prev, f_curr, k_curr] = emit
 
@@ -132,32 +164,43 @@ def run_constrained_forward_pass(
             f_prev = true_fingers[t-1] - 1
 
             for k_curr in range(N_ANCHORS):
-                delta_pitch = -ANCHORS[k_curr]
-                emit = compute_emission_score(delta_pitch, f_curr, rbf_mu, rbf_sigma)
+                note_coord_x = PITCH_TO_KEYPOS_LUT[notes_pitch[t]][0]
+                hand_pos_center_x = note_coord_x + ANCHORS[k_curr]
+                emit = compute_emission_score(
+                    note_coord_x,
+                    hand_pos_center_x,
+                    f_curr,
+                    rbf_mu,
+                    rbf_sigma
+                )
 
                 max_prob = -np.inf
                 best_k_prev = -1
                 best_f_prev2 = -1
 
                 for k_prev in range(N_ANCHORS):
-                    hand_pos_prev = _clip(notes_pitch[t-1] + ANCHORS[k_prev], 0, 127)
-                    hand_pos_curr = _clip(notes_pitch[t] + ANCHORS[k_curr], 0, 127)
+                    note_coord_x_prev = PITCH_TO_KEYPOS_LUT[notes_pitch[t-1]][0]
+                    hand_center_x_prev = note_coord_x_prev + ANCHORS[k_prev]
 
-                    x1, y1 = PITCH_TO_KEYPOS_LUT[hand_pos_prev]
-                    x2, y2 = PITCH_TO_KEYPOS_LUT[hand_pos_curr]
+                    note_coord_x_curr = PITCH_TO_KEYPOS_LUT[notes_pitch[t]][0]
+                    hand_center_x_curr = note_coord_x_curr + ANCHORS[k_curr]
 
-                    dx = float(x2 - x1)
-                    dy = float(y2 - y1)
-                    dist = np.sqrt(dx*dx + dy*dy)
+                    dist = np.abs(hand_center_x_curr - hand_center_x_prev)
 
                     inertia = compute_inertia_cost(dist, dt, inertia_param_slope, inertia_param_center, inertia_weight)
 
                     for f_prev2 in range(N_FINGERS):
+                        # Heuristic bonus for smooth finger transitions
+                        agility_bonus = 0.0
+                        if abs(f_curr - f_prev) <= 1:
+                            agility_bonus = 0.3  # Reward for adjacent fingers
+                        else:
+                            agility_bonus = -0.3 # Penalty for jumps
                         prev_prob = lattice_log_probs[t-1, f_prev2, f_prev, k_prev]
                         agility = agility_matrix[f_prev2, f_prev, f_curr]
 
                         smoothing = np.abs(ANCHORS[k_curr] - ANCHORS[k_prev]) * smoothing_weight
-                        candidate = prev_prob + agility - inertia - smoothing + emit
+                        candidate = prev_prob + agility - inertia - smoothing + emit + agility_bonus
 
                         if candidate > max_prob:
                             max_prob = candidate
@@ -172,8 +215,15 @@ def run_constrained_forward_pass(
             # --- UNCONSTRAINED (STANDARD FORWARD) PATH ---
             for f_curr in range(N_FINGERS):
                 for k_curr in range(N_ANCHORS):
-                    delta_pitch = -ANCHORS[k_curr]
-                    emit = compute_emission_score(delta_pitch, f_curr, rbf_mu, rbf_sigma)
+                    note_coord_x = PITCH_TO_KEYPOS_LUT[notes_pitch[t]][0]
+                    hand_pos_center_x = note_coord_x + ANCHORS[k_curr]
+                    emit = compute_emission_score(
+                        note_coord_x,
+                        hand_pos_center_x,
+                        f_curr,
+                        rbf_mu,
+                        rbf_sigma
+                    )
 
                     for f_prev in range(N_FINGERS):
                         max_prob = -np.inf
@@ -181,24 +231,28 @@ def run_constrained_forward_pass(
                         best_f_prev2 = -1
 
                         for k_prev in range(N_ANCHORS):
-                            hand_pos_prev = _clip(notes_pitch[t-1] + ANCHORS[k_prev], 0, 127)
-                            hand_pos_curr = _clip(notes_pitch[t] + ANCHORS[k_curr], 0, 127)
+                            note_coord_x_prev = PITCH_TO_KEYPOS_LUT[notes_pitch[t-1]][0]
+                            hand_center_x_prev = note_coord_x_prev + ANCHORS[k_prev]
 
-                            x1, y1 = PITCH_TO_KEYPOS_LUT[hand_pos_prev]
-                            x2, y2 = PITCH_TO_KEYPOS_LUT[hand_pos_curr]
+                            note_coord_x_curr = PITCH_TO_KEYPOS_LUT[notes_pitch[t]][0]
+                            hand_center_x_curr = note_coord_x_curr + ANCHORS[k_curr]
 
-                            dx = float(x2 - x1)
-                            dy = float(y2 - y1)
-                            dist = np.sqrt(dx*dx + dy*dy)
+                            dist = np.abs(hand_center_x_curr - hand_center_x_prev)
 
                             inertia = compute_inertia_cost(dist, dt, inertia_param_slope, inertia_param_center, inertia_weight)
 
                             for f_prev2 in range(N_FINGERS):
+                                # Heuristic bonus for smooth finger transitions
+                                agility_bonus = 0.0
+                                if abs(f_curr - f_prev) <= 1:
+                                    agility_bonus = 0.3  # Reward for adjacent fingers
+                                else:
+                                    agility_bonus = -0.3 # Penalty for jumps
                                 prev_prob = lattice_log_probs[t-1, f_prev2, f_prev, k_prev]
                                 agility = agility_matrix[f_prev2, f_prev, f_curr]
 
                                 smoothing = np.abs(ANCHORS[k_curr] - ANCHORS[k_prev]) * smoothing_weight
-                                candidate = prev_prob + agility - inertia - smoothing + emit
+                                candidate = prev_prob + agility - inertia - smoothing + emit + agility_bonus
 
                                 if candidate > max_prob:
                                     max_prob = candidate

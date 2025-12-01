@@ -1,8 +1,8 @@
 import numpy as np
-from .core import SoftPositionModel, ANCHORS
+from .core import SoftPositionModel, ANCHORS, FINGER_BASE_POS
 from .structural import ViterbiLattice, N_FINGERS
 from .inference import run_constrained_forward_pass, backtracking
-from .utils import load_pig_file, apply_time_dep_pitch_order, FINGER_UNKNOWN
+from .utils import load_pig_file, apply_time_dep_pitch_order, FINGER_UNKNOWN, PITCH_TO_KEYPOS_LUT
 
 class SoftPositionTrainer:
     def __init__(self):
@@ -10,7 +10,7 @@ class SoftPositionTrainer:
         # Initialize agility with uniform log-probs (effectively zeros if not normalized, 
         # but logically should be log(1/5)). 
         # Here we start with 0.0 as per original design, but it will be overwritten.
-        self.agility_matrix = np.full((5, 5, 5), 1.0 / 125, dtype=np.float64)
+        self.agility_matrix = np.log(np.full((5, 5, 5), 1.0 / 125, dtype=np.float64))
 
     def train(self, file_paths: list, n_iterations: int = 5, smoothing_weight: float = 0.0) -> list:
         """
@@ -79,8 +79,22 @@ class SoftPositionTrainer:
                     if true_fingers[i] != FINGER_UNKNOWN:
                         finger_idx = true_fingers[i] - 1
                         anchor_idx = opt_anchors[i]
-                        hand_pos = notes_pitch[i] + ANCHORS[anchor_idx]
-                        delta = notes_pitch[i] - hand_pos
+
+                        # Get physical coordinates
+                        note_coord_x = PITCH_TO_KEYPOS_LUT[notes_pitch[i]][0]
+                        anchor_pos_x = ANCHORS[anchor_idx] # Anchor is now an absolute offset
+
+                        # This needs to be consistent with the inference step
+                        # The anchor is an offset from the note's physical position to the hand's center
+                        hand_pos_center_x = note_coord_x + anchor_pos_x
+
+                        # Calculate the target x-position of the finger
+                        finger_target_pos = hand_pos_center_x + FINGER_BASE_POS[finger_idx]
+
+                        # The delta is the difference between the finger's actual target and the note's position
+                        # This represents the error the RBF learns to model
+                        delta = note_coord_x - finger_target_pos
+
                         finger_deltas[finger_idx].append(delta)
                 
                 # B. Transitions (for Agility)
@@ -111,7 +125,7 @@ class SoftPositionTrainer:
             if len(finger_deltas[i]) > 1:
                 computed_mean = np.mean(finger_deltas[i])
                 new_mu = 0.9 * self.model.rbf_mu[i] + 0.1 * computed_mean
-                self.model.rbf_mu[i] = np.clip(new_mu, -12, 12)
+                self.model.rbf_mu[i] = np.clip(new_mu, -100, 100)
 
                 new_sigma = np.std(finger_deltas[i])
                 # Ensure sigma doesn't collapse to 0

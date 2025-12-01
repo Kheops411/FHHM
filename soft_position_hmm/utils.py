@@ -7,25 +7,39 @@ import re
 FINGER_UNKNOWN = -999
 
 # Global LUT: (128 pitches, 2 coordinates [x, y])
-PITCH_TO_KEYPOS_LUT = np.zeros((128, 2), dtype=np.int16)
+PITCH_TO_KEYPOS_LUT = np.zeros((128, 2), dtype=np.float32)
 
 def _compute_pitch_to_keypos_lut():
+    """
+    Computes a LUT mapping MIDI pitch to a (x, y) coordinate system.
+    - X is the lateral position in pseudo-mm.
+    - Y is the vertical position (0 for white keys, 1 for black keys).
+    Based on standard piano key dimensions.
+    """
+    # White key properties
+    WHITE_KEY_WIDTH = 23.5  # pseudo-mm
+    # Pitch class to white key index mapping (0=C, 1=D, etc.)
+    PC_TO_WHITE_KEY = {0: 0, 2: 1, 4: 2, 5: 3, 7: 4, 9: 5, 11: 6}
+
     for pitch in range(128):
-        pc = pitch % 12
-        octave = (pitch // 12) - 1
-        x = 0
-        if pc in (0, 1): x = 0
-        elif pc in (2, 3): x = 1
-        elif pc == 4: x = 2
-        elif pc in (5, 6): x = 3
-        elif pc in (7, 8): x = 4
-        elif pc in (9, 10): x = 5
-        elif pc == 11: x = 6
-        x += 7 * (octave - 4)
-        y = 1
-        if pc in (0, 2, 4, 5, 7, 9, 11): y = 0
-        PITCH_TO_KEYPOS_LUT[pitch, 0] = x
-        PITCH_TO_KEYPOS_LUT[pitch, 1] = y
+        octave = pitch // 12
+        pc = pitch % 12  # Pitch Class (0-11 for C, C#, ..., B)
+
+        if pc in PC_TO_WHITE_KEY:
+            # This is a white key
+            white_key_index = PC_TO_WHITE_KEY[pc]
+            x_pos = octave * 7 * WHITE_KEY_WIDTH + white_key_index * WHITE_KEY_WIDTH
+            y_pos = 0
+        else:
+            # This is a black key. Position it relative to the previous white key.
+            prev_white_key_pc = pc - 1
+            white_key_index = PC_TO_WHITE_KEY[prev_white_key_pc]
+            # Black keys are positioned halfway between white keys
+            x_pos = octave * 7 * WHITE_KEY_WIDTH + white_key_index * WHITE_KEY_WIDTH + (WHITE_KEY_WIDTH / 2.0)
+            y_pos = 1
+
+        PITCH_TO_KEYPOS_LUT[pitch, 0] = x_pos
+        PITCH_TO_KEYPOS_LUT[pitch, 1] = y_pos
 
 _compute_pitch_to_keypos_lut()
 

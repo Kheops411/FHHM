@@ -3,6 +3,9 @@ import numba as nb
 from typing import Tuple
 import re
 
+# Global Constant for unknown/invalid fingers
+FINGER_UNKNOWN = -999
+
 # Global LUT: (128 pitches, 2 coordinates [x, y])
 PITCH_TO_KEYPOS_LUT = np.zeros((128, 2), dtype=np.int16)
 
@@ -98,8 +101,8 @@ def clean_finger_str(finger_str: str) -> int:
         if -5 <= finger_val < 0:
             return finger_val
     except (ValueError, IndexError):
-        pass # Return 0 for invalid parsing
-    return 0 # Default/invalid
+        pass
+    return FINGER_UNKNOWN
 
 def load_pig_file(filepath: str) -> np.ndarray:
     """
@@ -192,19 +195,3 @@ def apply_time_dep_pitch_order(notes: np.ndarray, time_threshold: float = 0.03) 
         i = j
 
     return np.array(reordered_notes, dtype=notes.dtype)
-
-
-def filter_notes_by_hand(notes: np.ndarray, hand: int) -> np.ndarray:
-    """
-    Filters notes based on the finger sign.
-    Hand 0 (RH) -> Finger > 0
-    Hand 1 (LH) -> Finger < 0
-    """
-    if notes.shape[0] == 0:
-        return np.array([], dtype=notes.dtype)
-
-    # Use the pre-parsed integer 'finger' field for filtering
-    if hand == 0: # Right Hand
-        return notes[notes['finger'] > 0]
-    else: # Left Hand
-        return notes[notes['finger'] < 0]

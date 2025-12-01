@@ -2,7 +2,7 @@ import numpy as np
 from .core import SoftPositionModel, ANCHORS
 from .structural import ViterbiLattice, N_FINGERS
 from .inference import run_constrained_forward_pass, backtracking
-from .utils import load_pig_file, apply_time_dep_pitch_order, filter_notes_by_hand
+from .utils import load_pig_file, apply_time_dep_pitch_order, FINGER_UNKNOWN
 
 class SoftPositionTrainer:
     def __init__(self):
@@ -10,7 +10,7 @@ class SoftPositionTrainer:
         # Initialize agility with uniform log-probs (effectively zeros if not normalized, 
         # but logically should be log(1/5)). 
         # Here we start with 0.0 as per original design, but it will be overwritten.
-        self.agility_matrix = np.zeros((5, 5, 5), dtype=np.float64)
+        self.agility_matrix = np.full((5, 5, 5), 1.0 / 125, dtype=np.float64)
 
     def train(self, file_paths: list, n_iterations: int = 5, smoothing_weight: float = 0.0) -> list:
         """
@@ -38,8 +38,7 @@ class SoftPositionTrainer:
                     print(f"Skipping file {fpath}: {e}")
                     continue
 
-                notes_rh = filter_notes_by_hand(notes, 0) # 0 for Right Hand
-                notes_sorted = apply_time_dep_pitch_order(notes_rh)
+                notes_sorted = apply_time_dep_pitch_order(notes)
 
                 n_obs = len(notes_sorted)
                 if n_obs == 0:
@@ -77,11 +76,12 @@ class SoftPositionTrainer:
                 _, opt_anchors = backtracking(n_obs, lattice.log_probs, lattice.backpointers)
 
                 for i in range(n_obs):
-                    finger_idx = true_fingers[i] - 1
-                    anchor_idx = opt_anchors[i]
-                    hand_pos = notes_pitch[i] + ANCHORS[anchor_idx]
-                    delta = notes_pitch[i] - hand_pos
-                    finger_deltas[finger_idx].append(delta)
+                    if true_fingers[i] != FINGER_UNKNOWN:
+                        finger_idx = true_fingers[i] - 1
+                        anchor_idx = opt_anchors[i]
+                        hand_pos = notes_pitch[i] + ANCHORS[anchor_idx]
+                        delta = notes_pitch[i] - hand_pos
+                        finger_deltas[finger_idx].append(delta)
                 
                 # B. Transitions (for Agility)
                 # We iterate from index 2 to account for the 2nd order dependency
@@ -109,10 +109,13 @@ class SoftPositionTrainer:
         print("Updating RBF parameters (mu and sigma)...")
         for i in range(N_FINGERS):
             if len(finger_deltas[i]) > 1:
-                self.model.rbf_mu[i] = np.mean(finger_deltas[i])
+                computed_mean = np.mean(finger_deltas[i])
+                new_mu = 0.9 * self.model.rbf_mu[i] + 0.1 * computed_mean
+                self.model.rbf_mu[i] = np.clip(new_mu, -12, 12)
+
                 new_sigma = np.std(finger_deltas[i])
                 # Ensure sigma doesn't collapse to 0
-                self.model.rbf_sigma[i] = max(0.5, new_sigma)
+                self.model.rbf_sigma[i] = max(0.3, new_sigma)
         print("Model RBF parameters updated.")
 
     def _update_agility_parameters(self, counts):
@@ -123,42 +126,17 @@ class SoftPositionTrainer:
         """
         print("Updating Agility Matrix...")
         
+        # Apply Laplace Smoothing
+        smoothed_counts = counts + 1e-3
+
         # 1. Sum counts for normalization: sum over the destination finger (axis 2)
-        # Shape: (5, 5, 1)
-        sums = counts.sum(axis=2, keepdims=True)
+        sums = smoothed_counts.sum(axis=2, keepdims=True)
         
-        # 2. Identify rows with no data
-        # Boolean mask where sum is 0
-        missing_data_mask = (sums == 0)
+        # 2. Calculate Probabilities
+        probs = smoothed_counts / sums
         
-        # 3. Avoid division by zero
-        # Temporarily set sum to 1.0 so division works (result will be 0, corrected later)
-        sums[missing_data_mask] = 1.0
-        
-        # 4. Calculate Probabilities (ML Estimate)
-        probs = counts / sums
-        
-        # 5. Apply Fallback for Missing Data (Uniform Distribution)
-        # If no data observed, probability is 1/5 for all 5 fingers
-        # We broadcast the scalar 0.2 into the masked locations
-        uniform_prob = 1.0 / 5.0 # 0.2
-        
-        # We need to broadcast the mask (5,5,1) to (5,5,5) to set values
-        # Or simply iterate. Vectorized approach:
-        # P[i,j,:] = 0.2 where mask[i,j,0] is True
-        
-        # Efficient numpy assignment using broadcasting:
-        # missing_data_mask is (5,5,1). 
-        # We want to affect probs where mask is True. 
-        # probs has shape (5,5,5).
-        # We can use np.where
-        
-        probs = np.where(missing_data_mask, uniform_prob, probs)
-        
-        # 6. Convert to Log-Probabilities
-        # Add epsilon solely for numerical stability of the '0' entries in observed rows
-        epsilon = 1e-12
-        self.agility_matrix = np.log(probs + epsilon)
+        # 3. Convert to Log-Probabilities
+        self.agility_matrix = np.log(probs + 1e-12)
         
         # Debug: Check non-zero entries
         non_zeros = np.count_nonzero(counts)

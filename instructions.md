@@ -1,483 +1,617 @@
-# Introduction
+### Instructions for Fixing the `soft_position_hmm` Module **
 
-The program in `soft_position_hmm` implements a probabilistic model (2nd‑order HMM) to predict or learn piano fingering from sequences of MIDI notes.
+#### **1. Project Context**
 
-**Summary of roles:**
+This project, `soft_position_hmm`, is a machine learning model that predicts piano fingering. It analyzes a sequence of musical notes (pitch, timing) and outputs the most likely sequence of fingers (1-5) to play them.
 
-* **core.py**: defines the basic biomechanical model.  
-  * Numba functions to compute:  
-    * an emission score (finger ↔ pitch interval compatibility),  
-    * an inertia cost (difficulty of hand movement).  
-  * Model parameters (RBF for each finger, temporal inertia).
+Your task is to fix several critical bugs in the core logic that prevent the model from being trained correctly. The bugs relate to how the model handles the geometry of the left hand versus the right hand, and how the main algorithm (Viterbi algorithm) is initialized.
 
-* **structural.py**: defines the structure of the Viterbi lattice (log‑probabilities, backpointers) for optimal path search in the HMM.
+You will not need to understand the complex math, but you must follow the instructions **exactly** as written to ensure the fixes are implemented correctly.
 
-* **utils.py**: utility functions.  
-  * Conversion MIDI pitch → keyboard position.  
-  * Strict parsing of annotated files (PIG).  
-  * Temporal sorting of notes and filtering by hand.
+#### **2. Mandatory Work Protocol**
 
-* **inference.py**: core of the HMM algorithm.  
-  * Forward pass (constrained or free) that fills the lattice by combining emission, inertia, transitions, and smoothing.  
-  * Backtracking to extract the optimal sequence of fingers and anchors.
+This is the most important rule. You must document every action.
 
-* **training.py**: EM loop for parameter learning.  
-  * E‑step: optimal anchoring constrained by true fingers.  
-  * M‑step: update of RBF parameters and agility matrix (transition probabilities between fingers).
+1.  In the root directory of the project, create a file named `FIX_LOG.md`.
+2.  Before you make **any** change to the code, you must first write in `FIX_LOG.md` what you are about to do. Use the heading `## Planning: Step X.Y`.
+3.  After you complete the change, you must write in `FIX_LOG.md` what you did and copy-paste the provided reason. Use the heading `### Action & Justification`.
+4.  After you run a test script, you must copy the **entire console output** into the log file and write a one-sentence conclusion. Use the heading `### Result & Conclusion`.
 
-* **interface.py**: high‑level user API.  
-  * Takes a sequence of notes and produces predictive fingering by calling forward pass + backtracking.
+Failure to follow this protocol means the work is incomplete.
 
-**Overview of operation:**
+#### **3. Initial Setup**
 
-1. Notes are read, cleaned, ordered, and filtered by hand.  
-2. The model evaluates for each note the likelihood of using a given finger and hand position.  
-3. The HMM explores all possible combinations and selects the most probable trajectory (Viterbi).  
-4. In training mode, this trajectory is used to re‑estimate parameters (EM).  
-5. In prediction mode, the optimal finger sequence is retrieved.  
+1.  Create the `FIX_LOG.md` file in the project's root directory.
+2.  Create a temporary file named `run_test.py` in the project's root directory. You will use this single file for all intermediate tests by replacing its content at each step.
 
----  
-
-
-# Technical Specification — Soft-Position HMM
-
-## 1. Model and Lattice Structure
-
-The model is a 2nd-order HMM for fingers and a 1st-order HMM for anchors.
-For each time step ($t$), the lattice contains all combinations of:
-
-*   current finger
-    $$ f_t \in \{0,1,2,3,4\}, $$
-*   previous finger
-    $$ f_{t-1} \in \{0,1,2,3,4\}, $$
-*   current anchor
-    $$ k_t \in \{0,\dots,24\}. $$
-
-The lattice dimensions are:
-$$ T \times 5 \times 5 \times 25. $$
-
-Transitions also require ($f_{t-2}$) and the previous anchor ($k_{t-1}$).
-The exact lattice structure is defined in `structural.py` (log-probability matrices, backpointers, storage of two successive fingers, etc.).
+#### **4. Step-by-Step Instructions to Fix the Code**
 
 ---
 
-## 2. Emission Model
+### **Step 1: Correct the Hand Geometry Model (`soft_position_hmm/core.py`)**
 
-**Module:** `core.compute_emission_score`
+**1.1. Add Correct Left-Hand Geometry Constants**
 
-For a time step ($t$), emission depends on the finger ($f_t$) and the anchor ($k_t$), applied to the MIDI pitch note ($p_t$).
+*   **Planning:** Log that you are about to modify `soft_position_hmm/core.py` to add constants for each hand's finger positions with the correct mirroring logic.
+*   **Action:** Open `soft_position_hmm/core.py`. Find this line:
+    ```python
+    FINGER_BASE_POS = np.array([-40.0, -20.0, 0.0, 20.0, 40.0], dtype=np.float64)
+    ```
+    **REPLACE** it with these two lines:
+    ```python
+    RH_FINGER_BASE_POS = np.array([-40.0, -20.0, 0.0, 20.0, 40.0], dtype=np.float64)
+    LH_FINGER_BASE_POS = RH_FINGER_BASE_POS[::-1]  # Correct mirrored geometry for the left hand
+    ```
+*   **Justification Log:** "This change creates two distinct geometric models, one for each hand. For the left hand, the finger order is mirrored relative to the right hand: the pinky (finger 5, index 4) is on the left (-40 offset) and the thumb (finger 1, index 0) is on the right (+40 offset). This physical model is essential for correctness and works in concert with the inversion of note coordinates (`notes_coord_x *= -1`) to correctly place the hand on the keyboard."
+*   **Test:** **REPLACE** the content of `run_test.py` with the following code and run it.
+    ```python
+    import numpy as np
+    from soft_position_hmm.core import RH_FINGER_BASE_POS, LH_FINGER_BASE_POS
+    
+    print("--- Running Test for Step 1.1 ---")
+    expected_lh_pos = np.array([40.0, 20.0, 0.0, -20.0, -40.0], dtype=np.float64)
+    
+    try:
+        assert np.array_equal(LH_FINGER_BASE_POS, expected_lh_pos), "LH_FINGER_BASE_POS is incorrect!"
+        # Add a consistency check
+        assert np.allclose(RH_FINGER_BASE_POS, LH_FINGER_BASE_POS[::-1]), "Hand models are not symmetric mirrors of each other."
+        print("SUCCESS: Left-hand finger positions are correctly defined and symmetric.")
+    except Exception as e:
+        print(f"FAILURE: {e}")
+        print("Expected:", expected_lh_pos)
+        print("Got:", LH_FINGER_BASE_POS)
+    ```
+*   **Result Log:** Log the full console output. The test must print "SUCCESS".
 
-### 2.1 Definition of Delta ($\delta_t$)
+**1.2. Update the `compute_emission_score` Function**
 
-The code defines:
-$$ \delta_t = -\mathrm{ANCHORS}[k_t], $$
-where `ANCHORS` is a constant array of 25 integers covering the range $[-12,+12]$ semitones.
-
-### 2.2 Biomechanical Parameters (per finger)
-
-Each finger ($f$) possesses:
-
-*   a mean ($\mu_f$),
-*   a standard deviation ($\sigma_f$).
-
-These parameters are updated during training.
-
-### 2.3 Standard Deviation Clamp (Inference)
-
-In inference, the code forces:
-$$ \hat\sigma_f = \max(\sigma_f, 1.0). $$
-
-### 2.4 Exact Formula
-
-The emission score is:
-$$ \mathrm{emit}(t,f_t,k_t) = -\log(\hat\sigma_{f_t}) - \tfrac12\log(2\pi) - \frac{(\delta_t - \mu_{f_t})^2}{2\hat\sigma_{f_t}^2}. $$
-
----
-
-## 3. Transition Model
-
-The transition score between $(f_{t-2},f_{t-1},k_{t-1})$ and $(f_{t-1},f_t,k_t)$ is:
-
-$$ \mathrm{trans} = \mathrm{agility} - \mathrm{inertia} - \mathrm{smoothing}. $$
-
-All components below correspond exactly to the provided files.
-
----
-
-### 3.1 Agility: Finger Trigram
-
-The model contains a tensor:
-$$ A \in \mathbb{R}^{5\times 5\times 5}, $$
-storing the **log-probabilities**:
-
-$$ \mathrm{agility} = A[f_{t-2}, f_{t-1}, f_t]. $$
-
-If untrained, `A` = 0 for all entries (uniform prior in log-space).
-
----
-
-### 3.2 Inertia: Hand Center Displacement Cost
-
-**Modules:** `core.compute_inertia_cost` and usage in `inference.py`
-
-The formula used in inference is **strictly scalar in semitones**; no conversion to 2D keyboard coordinates is performed.
-
-#### 3.2.1 Definition of Hand Center
-
-For a MIDI pitch note ($p_t$) and an anchor ($k_t$), the hand center is:
-$$ \mathrm{center}_t = p_t + \mathrm{ANCHORS}[k_t]. $$
-Both terms are integers (semitones).
-
-#### 3.2.2 Physical Distance Used
-
-The distance used in inertia is:
-$$ d_{\text{phys}} = |\mathrm{center}_t - \mathrm{center}_{t-1}|. $$
-
-It is a **1D distance in semitones**, in accordance with the code:
-
-```python
-hand_pos_prev = notes_pitch[t-1] + ANCHORS[k_prev]
-hand_pos_curr = notes_pitch[t]   + ANCHORS[k_curr]
-dist = np.abs(hand_pos_curr - hand_pos_prev)
-```
-
-#### 3.2.3 Simultaneity Constraint (dt < 1e-4)
-
-If notes are quasi-simultaneous:
-
-*   If ($d_{\text{phys}} > 10^{-4}$):
-    $$ \mathrm{inertia} = +\infty. $$
-*   Otherwise:
-    $$ \mathrm{inertia} = 0. $$
-
-#### 3.2.3 Standard Case (dt ≥ 1e-4)
-
-The code applies a sigmoidal stiffness factor:
-
-$$ \lambda(dt) = \frac{1}{1 + \exp(\mathrm{slope}\cdot(dt - \mathrm{center}))}. $$
-
-Final cost:
-$$ \mathrm{inertia} = \lambda(dt) \cdot d_{\text{phys}} \cdot w_{\text{inertia}}. $$
+*   **Planning:** Log that you are about to modify the `compute_emission_score` function in `soft_position_hmm/core.py` to accept the correct hand geometry.
+*   **Action:** In `soft_position_hmm/core.py`, **REPLACE** the entire `compute_emission_score` function with the code below.
+    ```python
+    @nb.njit(cache=True)
+    def compute_emission_score(
+        note_coord_x: float,
+        anchor_pos_x: float,
+        finger_idx: int,
+        rbf_mu: np.ndarray,
+        rbf_sigma: np.ndarray,
+        finger_base_pos: np.ndarray
+    ) -> float:
+        """
+        Computes the Log-PDF of the observed key position given the finger and anchor.
+        Formula: ln(P(x)) = -ln(sigma) - 0.5*ln(2pi) - 0.5*((x-mu)/sigma)^2
+        """
+        sigma_min = 1.0
+        finger_target_pos = anchor_pos_x + finger_base_pos[finger_idx]
+        delta = note_coord_x - finger_target_pos
+        mu = rbf_mu[finger_idx]
+        sigma = rbf_sigma[finger_idx]
+        if sigma < sigma_min:
+            sigma = sigma_min
+        variance = sigma * sigma
+        log_norm = -np.log(sigma) - HALF_LOG_2PI
+        quadratic = -((delta - mu) ** 2) / (2.0 * variance)
+        return log_norm + quadratic
+    ```
+*   **Justification Log:** "This change modifies the function to accept a `finger_base_pos` argument. This allows the same function to be used for both right and left hands, preventing calculation errors."
+*   **Test:** **REPLACE** the content of `run_test.py` with the following code and run it.
+    ```python
+    import numpy as np
+    from soft_position_hmm.core import compute_emission_score, RH_FINGER_BASE_POS, SoftPositionModel
+    
+    print("--- Running Test for Step 1.2 ---")
+    try:
+        model = SoftPositionModel()
+        score = compute_emission_score(
+            note_coord_x=500.0, anchor_pos_x=520.0, finger_idx=2,
+            rbf_mu=model.rbf_mu, rbf_sigma=model.rbf_sigma, finger_base_pos=RH_FINGER_BASE_POS
+        )
+        assert isinstance(score, float), "Function did not return a float."
+        print(f"SUCCESS: compute_emission_score executed with new argument. Result: {score:.4f}")
+    except Exception as e:
+        print(f"FAILURE: {e}")
+    ```
+*   **Result Log:** Log the full console output. The test must print "SUCCESS".
 
 ---
 
-### 3.3 Smoothing: Anchor Change
+### **Step 2: Correct the Viterbi Algorithm (`soft_position_hmm/inference.py`)**
 
-Smoothing penalizes anchor variation between two notes:
+**2.1. Update Imports and Fix the Viterbi Forward Pass Functions**
 
-$$ \mathrm{smoothing} = |\mathrm{ANCHORS}[k_t] - \mathrm{ANCHORS}[k_{t-1}]|\cdot w_{\mathrm{smooth}}. $$
+*   **Planning:** Log that you will replace the `run_forward_pass` and `run_constrained_forward_pass` functions in `soft_position_hmm/inference.py` to correctly handle the sequence initialization for a 2nd-order model.
+*   **Action:** In `soft_position_hmm/inference.py`, delete the unused `_clip` function. Then, **REPLACE** the entire content of both `run_forward_pass` and `run_constrained_forward_pass` with the code provided below.
+    ```python
+    import numpy as np
+    import numba as nb
+    from .core import compute_emission_score, compute_inertia_cost, ANCHORS
+    from .structural import N_FINGERS, N_ANCHORS
+
+    @nb.njit(cache=True)
+    def run_forward_pass(
+        n_obs: int,
+        notes_coord_x: np.ndarray,
+        notes_ontime: np.ndarray,
+        lattice_log_probs: np.ndarray,
+        lattice_backpointers: np.ndarray,
+        agility_matrix: np.ndarray,
+        inertia_param_slope: float,
+        inertia_param_center: float,
+        inertia_weight: float,
+        rbf_mu: np.ndarray,
+        rbf_sigma: np.ndarray,
+        smoothing_weight: float,
+        finger_base_pos: np.ndarray
+    ):
+        if n_obs == 0:
+            return
+
+        # A. Initialization (t = 0)
+        current_note_coord_x = notes_coord_x[0]
+        for f_curr in range(N_FINGERS):
+            for k_curr in range(N_ANCHORS):
+                hand_pos_center_x_abs = current_note_coord_x + ANCHORS[k_curr]
+                emit = compute_emission_score(
+                    current_note_coord_x,
+                    hand_pos_center_x_abs,
+                    f_curr,
+                    rbf_mu,
+                    rbf_sigma,
+                    finger_base_pos
+                )
+                for f_prev in range(N_FINGERS):
+                    lattice_log_probs[0, f_prev, f_curr, k_curr] = emit
+
+        if n_obs == 1:
+            return
+
+        # B. First Transition (t = 1) - Special Case
+        dt = notes_ontime[1] - notes_ontime[0]
+        current_note_coord_x = notes_coord_x[1]
+        prev_note_coord_x = notes_coord_x[0]
+        for f_curr in range(N_FINGERS):
+            for k_curr in range(N_ANCHORS):
+                hand_pos_center_x_curr_abs = current_note_coord_x + ANCHORS[k_curr]
+                emit = compute_emission_score(
+                    current_note_coord_x,
+                    hand_pos_center_x_curr_abs,
+                    f_curr,
+                    rbf_mu,
+                    rbf_sigma,
+                    finger_base_pos
+                )
+                for f_prev in range(N_FINGERS):
+                    max_prob = -np.inf
+                    best_k_prev = -1
+                    for k_prev in range(N_ANCHORS):
+                        hand_center_x_prev_abs = prev_note_coord_x + ANCHORS[k_prev]
+                        dist = np.abs(hand_pos_center_x_curr_abs - hand_center_x_prev_abs)
+                        inertia = compute_inertia_cost(dist, dt, inertia_param_slope, inertia_param_center, inertia_weight)
+                        smoothing = np.abs(ANCHORS[k_curr] - ANCHORS[k_prev]) * smoothing_weight
+                        prev_prob = lattice_log_probs[0, 0, f_prev, k_prev]
+                        candidate = prev_prob - inertia - smoothing + emit
+                        if candidate > max_prob:
+                            max_prob = candidate
+                            best_k_prev = k_prev
+                    lattice_log_probs[1, f_prev, f_curr, k_curr] = max_prob
+                    lattice_backpointers[1, f_prev, f_curr, k_curr, 0] = -1
+                    lattice_backpointers[1, f_prev, f_curr, k_curr, 1] = f_prev
+                    lattice_backpointers[1, f_prev, f_curr, k_curr, 2] = best_k_prev
+
+        # C. Main Recursion (t >= 2)
+        for t in range(2, n_obs):
+            dt = notes_ontime[t] - notes_ontime[t-1]
+            current_note_coord_x = notes_coord_x[t]
+            prev_note_coord_x = notes_coord_x[t-1]
+            for f_curr in range(N_FINGERS):
+                for k_curr in range(N_ANCHORS):
+                    hand_pos_center_x_curr_abs = current_note_coord_x + ANCHORS[k_curr]
+                    emit = compute_emission_score(
+                        current_note_coord_x,
+                        hand_pos_center_x_curr_abs,
+                        f_curr,
+                        rbf_mu,
+                        rbf_sigma,
+                        finger_base_pos
+                    )
+                    for f_prev in range(N_FINGERS):
+                        max_prob = -np.inf
+                        best_k_prev = -1
+                        best_f_prev2 = -1
+                        for k_prev in range(N_ANCHORS):
+                            hand_center_x_prev_abs = prev_note_coord_x + ANCHORS[k_prev]
+                            dist = np.abs(hand_pos_center_x_curr_abs - hand_center_x_prev_abs)
+                            inertia = compute_inertia_cost(dist, dt, inertia_param_slope, inertia_param_center, inertia_weight)
+                            for f_prev2 in range(N_FINGERS):
+                                prev_prob = lattice_log_probs[t-1, f_prev2, f_prev, k_prev]
+                                agility = agility_matrix[f_prev2, f_prev, f_curr]
+                                smoothing = np.abs(ANCHORS[k_curr] - ANCHORS[k_prev]) * smoothing_weight
+                                candidate = prev_prob + agility - inertia - smoothing + emit
+                                if candidate > max_prob:
+                                    max_prob = candidate
+                                    best_k_prev = k_prev
+                                    best_f_prev2 = f_prev2
+                        lattice_log_probs[t, f_prev, f_curr, k_curr] = max_prob
+                        lattice_backpointers[t, f_prev, f_curr, k_curr, 0] = best_f_prev2
+                        lattice_backpointers[t, f_prev, f_curr, k_curr, 1] = f_prev
+                        lattice_backpointers[t, f_prev, f_curr, k_curr, 2] = best_k_prev
+
+    @nb.njit(cache=True)
+    def run_constrained_forward_pass(
+        n_obs: int,
+        notes_coord_x: np.ndarray,
+        notes_ontime: np.ndarray,
+        true_fingers: np.ndarray,
+        lattice_log_probs: np.ndarray,
+        lattice_backpointers: np.ndarray,
+        agility_matrix: np.ndarray,
+        inertia_param_slope: float,
+        inertia_param_center: float,
+        inertia_weight: float,
+        rbf_mu: np.ndarray,
+        rbf_sigma: np.ndarray,
+        smoothing_weight: float,
+        finger_base_pos: np.ndarray
+    ):
+        if n_obs == 0:
+            return
+
+        # A. Initialization (t = 0)
+        current_note_coord_x = notes_coord_x[0]
+        f_init_range = range(N_FINGERS)
+        if true_fingers[0] != -999:
+            f_init_range = range(true_fingers[0] - 1, true_fingers[0])
+        for f_curr in f_init_range:
+            for k_curr in range(N_ANCHORS):
+                hand_pos_center_x_abs = current_note_coord_x + ANCHORS[k_curr]
+                emit = compute_emission_score(
+                    current_note_coord_x,
+                    hand_pos_center_x_abs,
+                    f_curr,
+                    rbf_mu,
+                    rbf_sigma,
+                    finger_base_pos
+                )
+                for f_prev in range(N_FINGERS):
+                    lattice_log_probs[0, f_prev, f_curr, k_curr] = emit
+
+        if n_obs == 1:
+            return
+
+        # B. First Transition (t = 1)
+        dt = notes_ontime[1] - notes_ontime[0]
+        current_note_coord_x = notes_coord_x[1]
+        prev_note_coord_x = notes_coord_x[0]
+        f_curr_range = range(N_FINGERS)
+        if true_fingers[1] != -999:
+            f_curr_range = range(true_fingers[1] - 1, true_fingers[1])
+        f_prev_range = range(N_FINGERS)
+        if true_fingers[0] != -999:
+            f_prev_range = range(true_fingers[0] - 1, true_fingers[0])
+
+        for f_curr in f_curr_range:
+            for k_curr in range(N_ANCHORS):
+                hand_pos_center_x_curr_abs = current_note_coord_x + ANCHORS[k_curr]
+                emit = compute_emission_score(
+                    current_note_coord_x,
+                    hand_pos_center_x_curr_abs,
+                    f_curr,
+                    rbf_mu,
+                    rbf_sigma,
+                    finger_base_pos
+                )
+                for f_prev in f_prev_range:
+                    max_prob = -np.inf
+                    best_k_prev = -1
+                    for k_prev in range(N_ANCHORS):
+                        hand_center_x_prev_abs = prev_note_coord_x + ANCHORS[k_prev]
+                        dist = np.abs(hand_pos_center_x_curr_abs - hand_center_x_prev_abs)
+                        inertia = compute_inertia_cost(dist, dt, inertia_param_slope, inertia_param_center, inertia_weight)
+                        smoothing = np.abs(ANCHORS[k_curr] - ANCHORS[k_prev]) * smoothing_weight
+                        prev_prob = lattice_log_probs[0, 0, f_prev, k_prev]
+                        candidate = prev_prob - inertia - smoothing + emit
+                        if candidate > max_prob:
+                            max_prob = candidate
+                            best_k_prev = k_prev
+                    lattice_log_probs[1, f_prev, f_curr, k_curr] = max_prob
+                    lattice_backpointers[1, f_prev, f_curr, k_curr, 0] = -1
+                    lattice_backpointers[1, f_prev, f_curr, k_curr, 1] = f_prev
+                    lattice_backpointers[1, f_prev, f_curr, k_curr, 2] = best_k_prev
+        
+        # C. Main Recursion (t >= 2)
+        for t in range(2, n_obs):
+            dt = notes_ontime[t] - notes_ontime[t-1]
+            current_note_coord_x = notes_coord_x[t]
+            prev_note_coord_x = notes_coord_x[t-1]
+            f_curr_range = range(N_FINGERS)
+            if true_fingers[t] != -999:
+                f_curr_range = range(true_fingers[t] - 1, true_fingers[t])
+            f_prev_range = range(N_FINGERS)
+            if true_fingers[t-1] != -999:
+                f_prev_range = range(true_fingers[t-1] - 1, true_fingers[t-1])
+
+            for f_curr in f_curr_range:
+                for k_curr in range(N_ANCHORS):
+                    hand_pos_center_x_curr_abs = current_note_coord_x + ANCHORS[k_curr]
+                    emit = compute_emission_score(
+                        current_note_coord_x,
+                        hand_pos_center_x_curr_abs,
+                        f_curr,
+                        rbf_mu,
+                        rbf_sigma,
+                        finger_base_pos
+                    )
+                    for f_prev in f_prev_range:
+                        max_prob = -np.inf
+                        best_k_prev = -1
+                        best_f_prev2 = -1
+                        for k_prev in range(N_ANCHORS):
+                            hand_center_x_prev_abs = prev_note_coord_x + ANCHORS[k_prev]
+                            dist = np.abs(hand_pos_center_x_curr_abs - hand_center_x_prev_abs)
+                            inertia = compute_inertia_cost(dist, dt, inertia_param_slope, inertia_param_center, inertia_weight)
+                            for f_prev2 in range(N_FINGERS):
+                                prev_prob = lattice_log_probs[t-1, f_prev2, f_prev, k_prev]
+                                agility = agility_matrix[f_prev2, f_prev, f_curr]
+                                smoothing = np.abs(ANCHORS[k_curr] - ANCHORS[k_prev]) * smoothing_weight
+                                candidate = prev_prob + agility - inertia - smoothing + emit
+                                if candidate > max_prob:
+                                    max_prob = candidate
+                                    best_k_prev = k_prev
+                                    best_f_prev2 = f_prev2
+                        lattice_log_probs[t, f_prev, f_curr, k_curr] = max_prob
+                        lattice_backpointers[t, f_prev, f_curr, k_curr, 0] = best_f_prev2
+                        lattice_backpointers[t, f_prev, f_curr, k_curr, 1] = f_prev
+                        lattice_backpointers[t, f_prev, f_curr, k_curr, 2] = best_k_prev
+    ```
+*   **Justification Log:** "The Viterbi algorithm was split into three stages: initialization (t=0), first transition (t=1), and main recursion (t>=2). This is required because the state structure `(f_prev, f_curr, k_curr)` for this 2nd-order HMM cannot use the full transition model for the first two notes. This new structure correctly handles the sequence boundaries."
+*   **Test:** **REPLACE** the content of `run_test.py` with the following and run it.
+    ```python
+    import numpy as np
+    from soft_position_hmm.core import SoftPositionModel, RH_FINGER_BASE_POS
+    from soft_position_hmm.inference import run_forward_pass
+    from soft_position_hmm.structural import ViterbiLattice
+
+    print("--- Running Test for Step 2.1 ---")
+    try:
+        n_obs = 3
+        model = SoftPositionModel()
+        lattice = ViterbiLattice(n_obs)
+        agility_matrix = np.zeros((5, 5, 5), dtype=np.float64)
+        
+        run_forward_pass(
+            n_obs=n_obs, notes_coord_x=np.array([500, 520, 540], dtype=np.float64), notes_ontime=np.array([0.1, 0.2, 0.3], dtype=np.float64),
+            lattice_log_probs=lattice.log_probs, lattice_backpointers=lattice.backpointers,
+            agility_matrix=agility_matrix, inertia_param_slope=model.time_slope,
+            inertia_param_center=model.time_center, inertia_weight=model.inertia_weight,
+            rbf_mu=model.rbf_mu, rbf_sigma=model.rbf_sigma, smoothing_weight=0.1,
+            finger_base_pos=RH_FINGER_BASE_POS
+        )
+        
+        assert np.isfinite(lattice.log_probs).any(), "Lattice contains no finite values."
+        assert lattice.log_probs[0, 0, 0, 0] > -np.inf, "Initialization at t=0 failed."
+        assert lattice.log_probs[1, 0, 0, 0] > -np.inf, "Transition at t=1 failed."
+        print("SUCCESS: run_forward_pass executed and filled lattice for a 3-note sequence.")
+    except Exception as e:
+        print(f"FAILURE: {e}")
+    ```
+*   **Result Log:** Log the console output. It must print "SUCCESS".
 
 ---
 
-## 4. Training (Hard EM — Viterbi Training)
+### **Step 3: Update High-Level Interfaces (`interface.py` & `training.py`)**
 
-**Module:** `training.py`
+**3.1. Update `interface.py`**
 
-Learning is performed entirely in log-probability space, with updates to biomechanical parameters and the agility tensor.
+*   **Planning:** Log that you will update `soft_position_hmm/interface.py` to pass the correct hand geometry.
+*   **Action:** Open `soft_position_hmm/interface.py`. **REPLACE** the entire `predict_fingering` function with the code below.
+    ```python
+    import numpy as np
+    from .core import SoftPositionModel, RH_FINGER_BASE_POS, LH_FINGER_BASE_POS
+    from .structural import ViterbiLattice
+    from .inference import run_forward_pass, backtracking
+    from .utils import PITCH_TO_KEYPOS_LUT
 
----
+    def predict_fingering(
+        notes_pitch: np.ndarray,
+        notes_ontime: np.ndarray,
+        model: SoftPositionModel,
+        agility_matrix: np.ndarray = None,
+        smoothing_weight: float = 0.0,
+        hand_sign: int = 1
+    ):
+        n_obs = len(notes_pitch)
+        if n_obs == 0:
+            return np.array([], dtype=np.int32), np.array([], dtype=np.int32)
 
-### 4.1 E-Step: Constrained Inference (Anchors Only)
+        lattice = ViterbiLattice(n_obs)
+        if agility_matrix is None:
+            agility_matrix = np.zeros((5, 5, 5), dtype=np.float64)
 
-The actual fingering provided in the data is imposed:
+        notes_coord_x = PITCH_TO_KEYPOS_LUT[notes_pitch, 0].copy()
+        
+        if hand_sign == -1:
+            notes_coord_x *= -1
+            finger_base_pos = LH_FINGER_BASE_POS
+        else:
+            finger_base_pos = RH_FINGER_BASE_POS
 
-*   Fingers ($f_t$) are *fixed* to the ground truth.
-*   Only anchors ($k_t$) are optimized.
-*   The modified forward pass is implemented in: `run_constrained_forward_pass`.
+        run_forward_pass(
+            n_obs=n_obs,
+            notes_coord_x=notes_coord_x,
+            notes_ontime=notes_ontime,
+            lattice_log_probs=lattice.log_probs,
+            lattice_backpointers=lattice.backpointers,
+            agility_matrix=agility_matrix,
+            inertia_param_slope=model.time_slope,
+            inertia_param_center=model.time_center,
+            inertia_weight=model.inertia_weight,
+            rbf_mu=model.rbf_mu,
+            rbf_sigma=model.rbf_sigma,
+            smoothing_weight=smoothing_weight,
+            finger_base_pos=finger_base_pos
+        )
 
----
+        fingers, anchors = backtracking(
+            n_obs,
+            lattice.log_probs,
+            lattice.backpointers
+        )
 
-### 4.2 M-Step: Parameter Updates
+        return fingers * hand_sign, anchors
+    ```
+*   **Justification Log:** "This updates the main prediction function to correctly select the right-hand or left-hand geometry model and pass it to the Viterbi algorithm."
 
-#### A. Emission Parameters (RBF per finger)
+**3.2. Update `training.py`**
 
-From the observed $\delta_t$ (defined by $-\mathrm{ANCHORS}[k_t]$):
+*   **Planning:** Log that you will update `soft_position_hmm/training.py` to use the corrected logic.
+*   **Action:** Open `soft_position_hmm/training.py`. **REPLACE** the entire `train` method with the code below.
+    ```python
+    from .core import SoftPositionModel, ANCHORS, RH_FINGER_BASE_POS, LH_FINGER_BASE_POS
+    from .structural import ViterbiLattice, N_FINGERS
+    from .inference import run_constrained_forward_pass, backtracking
+    from .utils import load_pig_file, apply_time_dep_pitch_order, FINGER_UNKNOWN, PITCH_TO_KEYPOS_LUT
+    
+    # ... inside the SoftPositionTrainer class ...
+    def train(self, file_paths: list, n_iterations: int = 5, smoothing_weight: float = 0.0) -> list:
+        log_likelihood_history = []
 
-$$ \mu_f \leftarrow \text{empirical mean}, \qquad \sigma_f \leftarrow \max(\text{empirical std dev}, 0.5). $$
+        for it in range(n_iterations):
+            print(f"--- Iteration {it + 1}/{n_iterations} ---")
 
-The **0.5** threshold is specific to training (different from the 1.0 threshold used in inference).
+            total_log_likelihood = 0.0
+            finger_deltas = [[] for _ in range(N_FINGERS)]
+            transition_counts = np.zeros((N_FINGERS, N_FINGERS, N_FINGERS), dtype=np.float64)
 
-#### B. Agility Tensor (Trigram)
+            for fpath in file_paths:
+                try:
+                    all_notes = load_pig_file(fpath)
+                except ValueError as e:
+                    print(f"Skipping file {fpath}: {e}")
+                    continue
 
-1.  Counting transitions:
-    $$ C(f_{t-2},f_{t-1},f_t). $$
+                rh_notes = all_notes[all_notes['channel'] == 0]
+                lh_notes = all_notes[all_notes['channel'] == 1]
+                sequences_to_process = [(rh_notes, 'RH'), (lh_notes, 'LH')]
 
-2.  Normalization for each pair $(f_{t-2},f_{t-1})$:
-    $$ P = C / \sum_{f_t} C. $$
+                for hand_notes, hand_name in sequences_to_process:
+                    if len(hand_notes) < 3:
+                        continue
 
-3.  Empty rows:
-    if $\sum_{f_t} C = 0$, then
-    $$ P(f_t) = 1/5. $$
+                    notes_sorted = apply_time_dep_pitch_order(hand_notes)
+                    n_obs = len(notes_sorted)
+                    notes_pitch = np.array([n['pitch'] for n in notes_sorted], dtype=np.int32)
+                    notes_ontime = np.array([n['ontime'] for n in notes_sorted], dtype=np.float64)
 
-4.  Conversion to log-space:
-    $$ A = \log(P + 10^{-12}). $$
+                    notes_coord_x = PITCH_TO_KEYPOS_LUT[notes_pitch, 0].copy()
+                    if hand_name == 'LH':
+                        notes_coord_x *= -1
+                        finger_base_pos_for_hand = LH_FINGER_BASE_POS
+                    else:
+                        finger_base_pos_for_hand = RH_FINGER_BASE_POS
 
----
+                    true_fingers = np.array(
+                        [abs(n['finger']) if n['finger'] != FINGER_UNKNOWN else FINGER_UNKNOWN # We use abs() because the hand (right/left) is determined by hand_name and the appropriate geometry is applied via finger_base_pos_for_hand
+                         for n in notes_sorted],
+                        dtype=np.int32
+                    )
 
-## 5. Input Data Pre-processing
+                    lattice = ViterbiLattice(n_obs)
+                    run_constrained_forward_pass(
+                        n_obs=n_obs,
+                        notes_coord_x=notes_coord_x,
+                        notes_ontime=notes_ontime,
+                        true_fingers=true_fingers,
+                        lattice_log_probs=lattice.log_probs,
+                        lattice_backpointers=lattice.backpointers,
+                        agility_matrix=self.agility_matrix,
+                        inertia_param_slope=self.model.time_slope,
+                        inertia_param_center=self.model.time_center,
+                        inertia_weight=self.model.inertia_weight,
+                        rbf_mu=self.model.rbf_mu,
+                        rbf_sigma=self.model.rbf_sigma,
+                        smoothing_weight=smoothing_weight,
+                        finger_base_pos=finger_base_pos_for_hand
+                    )
 
-**Module:** `utils.py`
+                    final_log_prob = np.max(lattice.log_probs[-1])
+                    if np.isfinite(final_log_prob):
+                        total_log_likelihood += final_log_prob
 
-### 5.1 PIG Parsing
+                    _, opt_anchors = backtracking(n_obs, lattice.log_probs, lattice.backpointers)
 
-Files contain exactly 8 columns.
-Fingers can be written as strings such as `"4_1"`; the code correctly extracts the main integer.
+                    for i in range(n_obs):
+                        if true_fingers[i] != FINGER_UNKNOWN:
+                            finger_idx = true_fingers[i] - 1
+                            anchor_idx = opt_anchors[i]
+                            
+                            hand_pos_center_x = notes_coord_x[i] + ANCHORS[anchor_idx]
+                            finger_target_pos = hand_pos_center_x + finger_base_pos_for_hand[finger_idx]
+                            delta = notes_coord_x[i] - finger_target_pos
+                            finger_deltas[finger_idx].append(delta)
 
-### 5.2 Hand Separation
+                    for i in range(2, n_obs):
+                        f_prev2 = true_fingers[i - 2] - 1
+                        f_prev1 = true_fingers[i - 1] - 1
+                        f_curr = true_fingers[i] - 1
 
-*   Right Hand: finger > 0
-*   Left Hand: finger < 0
+                        if 0 <= f_prev2 < 5 and 0 <= f_prev1 < 5 and 0 <= f_curr < 5:
+                            transition_counts[f_prev2, f_prev1, f_curr] += 1.0
 
-Lines where finger is 0 or invalid are rejected.
+            self._update_emission_parameters(finger_deltas)
+            self._update_agility_parameters(transition_counts)
+            log_likelihood_history.append(total_log_likelihood)
+            print(f"Total Log Likelihood: {total_log_likelihood}")
 
-### 5.3 Time Sorting and Simultaneity Handling
-
-1.  Primary sort by onset.
-2.  Simultaneity cluster detection:
-    two notes belong to the same cluster if the onset difference is < 0.03 s.
-3.  Secondary sort within each cluster by ascending pitch.
-
-The internal cluster order directly influences the correct application of the simultaneity inertia constraint.
-
----
-
-## 6. Model Result
-
-Inference (module `interface.py`):
-
-1.  constructs the full lattice ($T \times 5 \times 5 \times 25$),
-2.  fills scores via emission + transition accumulation,
-3.  performs backtracking (defined in `structural.py`),
-4.  returns the optimal sequence of fingers and anchors (or only fingers if requested).
-
-
-
-# Instructions
-
-**SUBJECT: STRICT PROTOCOL FOR REFACTORING AND DEBUGGING PIANO FINGERING HMM**
-
-You are tasked with refactoring a Python-based Hidden Markov Model (HMM) system. The current codebase contains critical mathematical and logical flaws.
-
-**STRICT OPERATIONAL RULES:**
-1.  **Do NOT rely on your intuition.** You do not know the domain (music/piano). Follow the mathematical instructions exactly.
-2.  **NO "Patching".** Do not hardcode values to satisfy a test case (e.g., `if value == 5: return expected_result`). You must fix the underlying logic/equation.
-3.  **NO "Magic Numbers" inside functions.** Define constants at the top of the module or in the class `__init__`.
-4.  **NO `if/else` spaghetti for math.** If I ask for a matrix initialization, do not write a loop with conditionals. Use Numpy vectorization.
-5.  **MANDATORY LOGGING:** Before *any* action (editing a file, running a script, even fixing a typo), you must append an entry to a file named `CHANGELOG_DEV.md` at the project root.
-    *   Format: `[TIMESTAMP] [FILE] [ACTION] [OBSERVATION]`
-    *   Example: `[10:05] core.py - Added clip() to inertia - Result: Integers are now bounded.`
-6.  **EXECUTION:** For every task, you must create a dedicated test script (`test_task_N.py`), run it, and paste the output into `CHANGELOG_DEV.md`. If the script fails, you do not proceed.
-
----
-
-### TASK 0: SETUP
-1.  Create `CHANGELOG_DEV.md` at the root.
-2.  Log the start of the session.
-
----
-
-### TASK 1: FIX AGILITY MATRIX INITIALIZATION
-**Context:** Currently, `agility_matrix` is initialized to zeros. In log-space, `log(0) = -inf`, which breaks the HMM (all probabilities become zero).
-**Target File:** `training.py`
-
-**Instructions:**
-1.  Locate `SoftPositionTrainer.__init__`.
-2.  Replace `np.zeros(...)` with a uniform distribution: `np.full((5, 5, 5), 1.0 / 125, dtype=np.float64)`.
-3.  In `_update_agility_parameters`:
-    *   Before calculating probabilities, apply Laplace Smoothing: add `1e-3` to `counts` to ensure no zero-counts exist.
-    *   Calculate `log_probs`. Ensure you use `np.log(probs + 1e-12)` (epsilon) as a safety net.
-
-**Validation Script (`test_task_1.py`):**
-```python
-import numpy as np
-from soft_position_hmm.training import SoftPositionTrainer
-
-trainer = SoftPositionTrainer()
-# Check initialization
-print(f"Init Mean: {np.mean(trainer.agility_matrix)}")
-assert np.all(trainer.agility_matrix > 0), "Matrix must be positive before log"
-
-# Check Update Logic
-counts = np.zeros((5,5,5)) # Empty counts
-trainer._update_agility_parameters(counts)
-print(f"Log Agility Max: {np.max(trainer.agility_matrix)}")
-print(f"Log Agility Min: {np.min(trainer.agility_matrix)}")
-
-# FAILURE CONDITION: If min is -inf or nan.
-if not np.isfinite(trainer.agility_matrix).all():
-    raise ValueError("Agility matrix contains Inf or NaN!")
-print("TASK 1 SUCCESS")
-```
-
----
-
-### TASK 2: FIX CHORD HANDLING AND TIMING
-**Context:** The condition `dt < 1e-4` is too strict for real-world data. It causes "teleportation" errors where infinite cost is applied to chords.
-**Target File:** `core.py` (logic) and `inference.py` (implementation)
-
-**Instructions:**
-1.  In `core.py`, modify `compute_inertia_cost`:
-    *   Change the logic to: **If `dt` is less than `0.03` (30ms), the inertia cost is `0.0`**, regardless of physical distance.
-    *   Do **NOT** simply change the `1e-4` threshold. You must add the explicit check: `if dt < 0.03: return 0.0`.
-    *   Remove the `return np.inf` logic for small time steps. Inertia should simply be zero for chords.
-
-**Validation Script (`test_task_2.py`):**
-```python
-from soft_position_hmm.core import compute_inertia_cost
-
-# Scenario: Two notes in a chord (dt=0.001), distance is 5 semitones
-cost_chord = compute_inertia_cost(physical_distance=5.0, dt=0.001, slope=10.0, center=0.2, weight=1.0)
-print(f"Cost Chord: {cost_chord}")
-
-# Scenario: Fast scale (dt=0.1), distance 5
-cost_scale = compute_inertia_cost(physical_distance=5.0, dt=0.1, slope=10.0, center=0.2, weight=1.0)
-print(f"Cost Scale: {cost_scale}")
-
-if cost_chord != 0.0:
-    raise ValueError("Chords (dt < 0.03) must have 0 inertia cost.")
-if cost_scale == 0.0:
-    raise ValueError("Scales must have non-zero inertia.")
-print("TASK 2 SUCCESS")
-```
+        return log_likelihood_history
+    ```
+*   **Justification Log:** "This updates the training loop to pass the correct hand geometry to the Viterbi algorithm and to correctly calculate the `delta` used for updating model parameters."
 
 ---
 
-### TASK 3: PARSING ROBUSTNESS
-**Context:** Currently, if a finger annotation is invalid/unknown, the parser returns `0` or drops the note. This corrupts the rhythm.
-**Target File:** `utils.py` and `inference.py`
+### **Step 4: Code Cleanup (`soft_position_hmm/structural.py`)**
 
-**Instructions:**
-1.  In `utils.py`:
-    *   Define a global constant: `FINGER_UNKNOWN = -999`.
-    *   Modify `clean_finger_str`: If parsing fails or input is invalid, return `FINGER_UNKNOWN` instead of `0`.
-    *   Modify `filter_notes_by_hand`: **Remove this filtering logic entirely.** Do not filter notes based on finger values. We need ALL notes to maintain correct `dt`.
-2.  In `inference.py`, inside `run_constrained_forward_pass`:
-    *   Locate where `f_curr` and `f_prev` are retrieved from `true_fingers`.
-    *   Add a condition: If `true_fingers[t] == -999`, do **NOT** force the path. Allow the loop to explore all `N_FINGERS` (treat it as an unconstrained hidden state for that step).
-    *   *Implementation Hint:* You likely need an `if/else` block: `if true_fingers[t] != -999: # enforce constraint ... else: # standard forward pass logic ...`
-
-**Validation Script (`test_task_3.py`):**
-```python
-import numpy as np
-from soft_position_hmm.utils import clean_finger_str, FINGER_UNKNOWN, filter_notes_by_hand
-from soft_position_hmm.structural import NOTE_DTYPE
-
-# 1. Test Parser
-res = clean_finger_str("invalid")
-if res != FINGER_UNKNOWN:
-    raise ValueError(f"Expected {FINGER_UNKNOWN}, got {res}")
-
-# 2. Test Filter
-# Create a dummy note array with an unknown finger
-dummy_notes = np.zeros(1, dtype=NOTE_DTYPE)
-dummy_notes[0]['finger'] = FINGER_UNKNOWN
-filtered = filter_notes_by_hand(dummy_notes, 0)
-
-if len(filtered) == 0:
-    raise ValueError("filter_notes_by_hand deleted the unknown note! It must persist.")
-print("TASK 3 SUCCESS")
-```
+*   **Action:** Open `soft_position_hmm/structural.py`. **DELETE** the line `N_STATES = ...`.
+*   **Justification Log:** "This constant was unused and misleading. Removing it improves clarity."
 
 ---
 
-### TASK 4: GEOMETRY UPDATE (EUCLIDEAN DISTANCE)
-**Context:** The system uses `delta_pitch` (1D semitones) for inertia. It needs 2D physical distance (keys).
-**Target File:** `inference.py`
+### **Step 5: Final and Robust Integration Test**
 
-**Instructions:**
-1.  Import `PITCH_TO_KEYPOS_LUT` from `.utils`.
-2.  In `run_forward_pass` and `run_constrained_forward_pass`:
-    *   Locate the inertia calculation loop.
-    *   Currently, it calculates `dist = abs(hand_pos_curr - hand_pos_prev)`. **This is wrong.**
-    *   You must calculate the **2D Euclidean distance**:
-        *   Get coordinates for `hand_pos_prev` (which is a pitch value) using the LUT.
-        *   Get coordinates for `hand_pos_curr` using the LUT.
-        *   `dx = x2 - x1`, `dy = y2 - y1`
-        *   `dist = sqrt(dx*dx + dy*dy)`
-    *   Pass *this* `dist` to `compute_inertia_cost`.
-    *   *Note:* Ensure you handle array bounds if `hand_pos` falls outside 0-127 (clamp it if necessary before looking up in LUT).
+*   **Action:** **REPLACE** the content of `run_test.py` with the following and run it.
+    ```python
+    import glob
+    import os
+    from soft_position_hmm.training import SoftPositionTrainer
 
-**Validation Script (`test_task_4.py`):**
-*No script provided. Run the existing `inference.py` logic. If it crashes with "IndexError", you forgot to clamp the pitch before LUT lookup. Log the fix.*
+    def create_synthetic_data(filepath="scores/synthetic_test.txt"):
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        content = """
+    0 0.1 0.2 C4 80 0 0 1
+    1 0.2 0.3 D4 80 0 0 2
+    2 0.3 0.4 E4 80 0 0 3
+    3 0.5 0.6 C3 80 0 1 -1
+    4 0.6 0.7 B2 80 0 1 -2
+    5 0.7 0.8 A2 80 0 1 -3
+    """
+        with open(filepath, "w") as f: f.write(content)
+        return [filepath]
 
----
+    print("--- Running Final Integration Test ---")
+    
+    file_paths = glob.glob('scores/001-*.txt')
+    if not file_paths:
+        print("No data files found in scores/. Creating synthetic data for test.")
+        file_paths = create_synthetic_data()
 
-### TASK 5: INERTIA CLIPPING
-**Context:** Large jumps cause infinite costs which break the math (NaNs).
-**Target File:** `core.py`
+    try:
+        print(f"Found {len(file_paths)} files for mini-training.")
+        trainer = SoftPositionTrainer()
+        trainer.train(file_paths=file_paths, n_iterations=1)
+        print("\nSUCCESS: The training process completed one iteration without errors.")
 
-**Instructions:**
-1.  In `compute_inertia_cost`:
-    *   After calculating `cost`, apply a clamp/min function.
-    *   `cost = min(cost, 8.0)`
-    *   This ensures that even impossible jumps have a finite probability (exp(-8) is small but not zero).
-
-**Validation Script (`test_task_5.py`):**
-```python
-from soft_position_hmm.core import compute_inertia_cost
-# Scenario: Impossible jump (distance 100), short time
-cost = compute_inertia_cost(100.0, 0.1, 10.0, 0.2, 1.0)
-print(f"Capped Cost: {cost}")
-if cost > 8.0001:
-    raise ValueError("Inertia cost was not capped!")
-print("TASK 5 SUCCESS")
-```
-
----
-
-### TASK 6: EM STABILITY
-**Context:** Training fails if `sigma` becomes 0 or if parameters oscillate.
-**Target File:** `training.py`
-
-**Instructions:**
-1.  In `_update_emission_parameters`:
-    *   Replace `self.model.rbf_sigma[i] = max(0.5, new_sigma)` with:
-        `self.model.rbf_sigma[i] = max(0.3, new_sigma)` (Allow slightly tighter variance).
-    *   Implement **Momentum** for `mu` updates. Do not simply overwrite `self.model.rbf_mu`.
-        *   Formula: `new_mu = 0.9 * self.model.rbf_mu[i] + 0.1 * computed_mean`
-        *   Then apply: `self.model.rbf_mu[i] = np.clip(new_mu, -12, 12)`
-
-**Validation Script (`test_task_6.py`):**
-```python
-import numpy as np
-from soft_position_hmm.training import SoftPositionTrainer
-
-trainer = SoftPositionTrainer()
-trainer.model.rbf_mu[0] = 5.0
-# Simulate data that would pull mu to -5.0
-deltas = [[-5.0]*10, [], [], [], []]
-
-trainer._update_emission_parameters(deltas)
-new_mu = trainer.model.rbf_mu[0]
-print(f"Old Mu: 5.0, Target: -5.0, New Mu (Momentum): {new_mu}")
-
-# Expected: 0.9*5 + 0.1*(-5) = 4.5 - 0.5 = 4.0
-if not (3.5 < new_mu < 4.5):
-    raise ValueError("Momentum logic is incorrect or missing.")
-print("TASK 6 SUCCESS")
-```
-
----
-
-### FINAL TASK: LEFT HAND SUPPORT (INTERFACE ONLY)
-**Context:** The model is agnostic, but the user needs positive (RH) and negative (LH) outputs.
-**Target File:** `interface.py`
-
-**Instructions:**
-1.  Modify `predict_fingering` signature to accept a new argument: `hand_sign: int = 1` (default to 1).
-2.  At the very end of the function, before returning `fingers`, multiply the result array:
-    `fingers = fingers * hand_sign`
-3.  Do NOT touch the internal logic of Viterbi.
-
-**Validation Script (`test_task_7.py`):**
-```python
-import numpy as np
-from soft_position_hmm.interface import predict_fingering
-# Mock objects not needed, just check if the function accepts the arg
-# and if we can visually confirm logic by reading the code or 
-# running a dummy prediction if possible.
-print("TASK 7: Manual Verify - check if 'fingers * hand_sign' is at end of predict_fingering.")
-```
-
-
-DO NOT FORGET TO APPEND AN ENTRY TO `CHANGELOG_DEV.md` FOR EACH ACTION (editing a file, running a script, even fixing a typo)
+    except Exception as e:
+        print(f"\nFAILURE: The integration test failed with an error: {e}")
+        import traceback
+        traceback.print_exc()
+    ```
+*   **Result Log:** Log the entire console output. If it prints "SUCCESS", your task is complete.

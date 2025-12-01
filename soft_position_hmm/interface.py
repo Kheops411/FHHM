@@ -2,6 +2,7 @@ import numpy as np
 from .core import SoftPositionModel
 from .structural import ViterbiLattice
 from .inference import run_forward_pass, backtracking
+from .utils import PITCH_TO_KEYPOS_LUT
 
 def predict_fingering(
     notes_pitch: np.ndarray,
@@ -9,26 +10,26 @@ def predict_fingering(
     model: SoftPositionModel,
     agility_matrix: np.ndarray = None,
     smoothing_weight: float = 0.0,
-    hand_sign: int = 1
+    hand_sign: int = 1 # 1 pour main droite (RH), -1 pour main gauche (LH)
 ):
     """
-    High-level API to predict fingerings for a sequence of notes.
+    API de haut niveau pour prédire le doigté d'une séquence de notes.
     """
     n_obs = len(notes_pitch)
     if n_obs == 0:
         return np.array([], dtype=np.int32), np.array([], dtype=np.int32)
 
-    # 1. Setup Data Structures
     lattice = ViterbiLattice(n_obs)
-
-    # Default agility if None (Zero log-prob = Uniform)
     if agility_matrix is None:
         agility_matrix = np.zeros((5, 5, 5), dtype=np.float64)
 
-    # 2. Run Forward Pass
+    notes_coord_x = PITCH_TO_KEYPOS_LUT[notes_pitch, 0].copy()
+    if hand_sign == -1:
+        notes_coord_x *= -1
+
     run_forward_pass(
         n_obs=n_obs,
-        notes_pitch=notes_pitch,
+        notes_coord_x=notes_coord_x,
         notes_ontime=notes_ontime,
         lattice_log_probs=lattice.log_probs,
         lattice_backpointers=lattice.backpointers,
@@ -41,7 +42,6 @@ def predict_fingering(
         smoothing_weight=smoothing_weight
     )
 
-    # 3. Backtrack
     fingers, anchors = backtracking(
         n_obs,
         lattice.log_probs,

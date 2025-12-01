@@ -56,13 +56,9 @@ def compute_inertia_cost(physical_distance: float, dt: float, slope: float, cent
     Computes the inertia cost for hand movement.
     Now includes a hard constraint for simultaneous notes (chords).
     """
-    # Hard Constraint: Teleportation check
-    # If time is negligible (chord) but hand moved, cost is infinite.
-    if dt < 1e-4:
-        if physical_distance > 1e-4:
-            return np.inf
-        else:
-            return 0.0
+    # Chord Handling: If notes are close enough in time, inertia is zero.
+    if dt < 0.03:
+        return 0.0
 
     # 1. Calculate Stiffness lambda(t) using Sigmoid
     # As dt -> 0, exp(...) -> large, stiffness -> 0 (wait, logic check below)
@@ -74,4 +70,4 @@ def compute_inertia_cost(physical_distance: float, dt: float, slope: float, cent
     # 2. Calculate Distance Cost
     cost = stiffness * physical_distance * weight
 
-    return cost
+    return min(cost, 8.0)

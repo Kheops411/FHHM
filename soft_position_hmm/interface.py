@@ -8,7 +8,8 @@ def predict_fingering(
     notes_ontime: np.ndarray,
     model: SoftPositionModel,
     agility_matrix: np.ndarray = None,
-    smoothing_weight: float = 0.0
+    smoothing_weight: float = 0.0,
+    hand_sign: int = 1
 ):
     """
     High-level API to predict fingerings for a sequence of notes.
@@ -47,4 +48,4 @@ def predict_fingering(
         lattice.backpointers
     )
 
-    return fingers, anchors
+    return fingers * hand_sign, anchors

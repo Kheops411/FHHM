@@ -59,15 +59,6 @@
           <line>4</line>
           </clef>
         </attributes>
-      <direction placement="above">
-        <direction-type>
-          <metronome>
-            <beat-unit>quarter</beat-unit>
-            <per-minute>60</per-minute>
-            </metronome>
-          </direction-type>
-        <sound tempo="60"/>
-        </direction>
       <note>
         <pitch>
           <step>C</step>

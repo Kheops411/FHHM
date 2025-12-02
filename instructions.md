@@ -1,167 +1,150 @@
+# Critical Fixes - Alignment with Legacy Physics & Timing
 
+**Context:**
+The SOA implementation failed verification (99% mismatch). The cause is a discrepancy in **units**.
+1.  **Timing:** The legacy system uses **Musical Time (Quarters)**, not Seconds.
+2.  **Space:** The legacy system uses an arbitrary **16.5cm Octave** model, not realistic mm geometry.
 
-# Implementation of High-Performance "ScoreData" Engines (SoA Architecture)
-
-**1. Project Context (Read Carefully)**
-We are optimizing a piano fingering system. Currently, the system uses slow Python objects. We have introduced a new data structure called `ScoreData` (defined in `structures.py`) which uses contiguous NumPy arrays for maximum performance.
-
-Your task is to implement "Adapters" and "Engines" that work natively with this `ScoreData` structure.
-
-**Resources available:**
-*   `structures.py`: Defines the `ScoreData` class. **Do not modify.**
-*   `geometry.py`: Defines `get_key_geometry(pitches)`. Returns physical X coordinates for keys. **Do not modify.**
-*   `tests/golden_data/`: Contains JSON files representing the "Ground Truth" (correct output).
-
-**2. Strict Development Rules (Zero Tolerance)**
-*   **NO PATCHING:** If a calculation is wrong, find the logical error in your array indexing or math. **DO NOT** add `if x == specific_value: return fixed_value`.
-*   **NO MAGIC NUMBERS:** Do not insert arbitrary weights or constants to make a test pass.
-*   **NO MODIFICATION OF LEGACY FILES:** You must create **NEW** files (`_soa.py`). Do not touch `legacy/engine.py` or `hmm/utils.py`.
-*   **VERIFY INTERNALS:** If a result seems wrong, print the intermediate arrays (`x_pos`, `costs`, etc.) to understand *why*.
-*   **MATH IS SACRED:** The probability formulas in the legacy engine are correct. Do not change them. Only change **how data is accessed** (Array Index vs Object Attribute).
+You must strictly replicate the "arbitrary" physics of the legacy system to reproduce its results.
 
 ---
 
-### Task 1: Create `xml_parser_soa.py`
+### Task 1: Update `structures.py`
 
-Create this file at the root. It converts the output of the existing XML parser into `ScoreData`.
+Modify the `ScoreData` class to store musical time.
 
-*   **Function Signature:** `def musicxml_to_soa(xml_path: str) -> Tuple[ScoreData, Dict[int, object]]`
-*   **Logic:**
-    1.  Use `MusicXMLParser(path).parse()` to get a list of `PlayedNote` objects.
-    2.  Filter out notes where `pitch` is `None` (rests).
-    3.  Allocate `ScoreData(len(notes))`.
-    4.  Fill arrays (`onset`, `offset`, `pitch`, `velocity`, `hand`, `measure`).
-    5.  **Crucial:** Create a dictionary `source_map = {}`. Store `id(note.xml_element)` in `ScoreData.source_ref[i]` and put the actual element in `source_map`.
-    6.  Call `soa.sort_canonical()`.
-
-### Task 2: Create `hmm/loader_soa.py`
-
-Create this file in `hmm/`. It loads PIG text files directly into `ScoreData`.
-
-*   **Function Signature:** `def load_pig_to_soa(filepath: str) -> ScoreData`
-*   **Logic:**
-    1.  Read the file line by line (skip comments `//` or `#`).
-    2.  Parse columns: ID, onset, offset, pitch(string), velocity... finger.
-    3.  Convert pitch string (e.g., "C#4") to MIDI int.
-    4.  **Constraint:** Do not use `numpy.genfromtxt` or complex regex if it's slow. Simple string splitting is preferred.
-    5.  Populate `ScoreData`.
-    6.  Call `soa.sort_canonical()`.
-
-### Task 3: Create `legacy/engine_soa.py`
-
-This is the most complex task. You must port the heuristic algorithm to use arrays.
-
-*   **Function Signature:** `def find_fingerings_soa(soa: ScoreData, hand_side: str) -> np.ndarray`
-*   **Logic:**
-    1.  **Filter:** Create a boolean mask for the requested hand (0=Right, 1=Left).
-    2.  **Geometry:** Call `geometry.get_key_geometry(soa.pitch[mask])` to get `x` and `is_black`.
-    3.  **Engine Porting:** Rewrite the `Hand` class from `legacy/engine.py` inside this new file, but:
-        *   Remove `self.noteseq` (list of objects).
-        *   Accept arrays in `__init__` (`x`, `onsets`, `durations`, `is_black`, `event_ids`).
-        *   In `_compute_transition_cost`, use `self.x[i]` instead of `note.x`.
-        *   In `_is_forbidden_transition`, use `self.event_ids[i] == self.event_ids[i-1]` to detect chords.
-    4.  **Output:** Return an array of fingers (int8) matching the original `soa` size (zeros for the other hand).
-
----
-
-### Task 4: Mandatory Verification
-
-You cannot just say "it works". You must create and run `verify_soa_implementation.py` with the code below. **If this script fails or prints mismatches, your work is incomplete.**
-
-**Create `verify_soa_implementation.py`:**
+**Action:** Add `onset_quarter` and `duration_quarter` to `__slots__` and `allocate`.
 
 ```python
-import sys
-import os
-import json
-import numpy as np
+@dataclass
+class ScoreData:
+    __slots__ = (
+        'onset', 'offset', 'pitch', 'velocity', 
+        'id', 'source_ref', 'event_id', 'measure', 'hand', 
+        'finger_gt', 'finger_out',
+        'onset_quarter', 'duration_quarter' # <--- ADD THESE
+    )
+    
+    # ... existing fields ...
+    onset_quarter: np.ndarray    # Musical time (Quarters)
+    duration_quarter: np.ndarray # Musical duration (Quarters)
 
-# Import your new modules
-try:
-    from xml_parser_soa import musicxml_to_soa
-    from hmm.loader_soa import load_pig_to_soa
-    from legacy.engine_soa import find_fingerings_soa
-    from structures import ScoreData
-except ImportError as e:
-    print(f"FAIL: Could not import new modules. {e}")
-    sys.exit(1)
-
-def check_golden(algo, name, soa_fingers, golden_path):
-    with open(golden_path, 'r') as f:
-        golden = json.load(f)
-    
-    # Golden is list of dicts. ScoreData is arrays.
-    # We must match them. Golden data is sorted. ScoreData is sorted.
-    # However, ScoreData contains ALL notes (both hands). Golden might be partial.
-    
-    match_count = 0
-    mismatch_count = 0
-    
-    print(f"Verifying {name}...")
-    
-    # We assume strict alignment because both are sorted canonically
-    # But we must filter soa by hand/validity to match golden
-    
-    # Simple check: Iterate golden, find corresponding note in SOA by time/pitch
-    for g_note in golden:
-        g_onset = g_note['onset']
-        g_pitch = g_note['pitch']
-        g_finger = g_note['finger']
-        
-        # Find in SOA
-        # This is slow O(N^2) but fine for verification script
-        matches = np.where(
-            (np.abs(soa.onset - g_onset) < 0.001) & 
-            (soa.pitch == g_pitch)
-        )[0]
-        
-        if len(matches) == 0:
-            print(f"  [ERROR] Golden note {g_onset}s pitch {g_pitch} not found in SOA!")
-            mismatch_count += 1
-            continue
-            
-        idx = matches[0]
-        soa_finger = soa.finger_out[idx]
-        
-        if soa_finger != g_finger:
-            print(f"  [MISMATCH] Time {g_onset:.2f} Pitch {g_pitch}: Expected {g_finger}, Got {soa_finger}")
-            # DEBUGGING HINT FOR DEVELOPER:
-            # If you see this, check your cost function weights or geometry mapping.
-            mismatch_count += 1
-        else:
-            match_count += 1
-
-    if mismatch_count == 0:
-        print(f"  [PASS] {match_count} notes matched perfectly.")
-    else:
-        print(f"  [FAIL] {mismatch_count} mismatches found.")
-
-def test_legacy_soa():
-    print("--- Testing Legacy SOA ---")
-    xml_path = "tests/resources/sanity_check.xml"
-    if not os.path.exists(xml_path):
-        print("Skipping Legacy test (file not found)")
-        return
-
-    # 1. Load
-    soa, _ = musicxml_to_soa(xml_path)
-    
-    # 2. Run Algo (Both hands)
-    fingers_rh = find_fingerings_soa(soa, "right")
-    fingers_lh = find_fingerings_soa(soa, "left")
-    
-    # Combine
-    soa.finger_out = fingers_rh + fingers_lh
-    
-    # 3. Check
-    check_golden("legacy", "sanity_check.xml", soa, "tests/golden_data/legacy_sanity_check.xml.json")
-
-if __name__ == "__main__":
-    test_legacy_soa()
+    @classmethod
+    def allocate(cls, n_notes: int):
+        return cls(
+            # ... existing fields ...
+            onset_quarter=np.zeros(n_notes, dtype=np.float64), # <--- INIT
+            duration_quarter=np.zeros(n_notes, dtype=np.float64), # <--- INIT
+        )
 ```
 
-**Deliverables:**
-1.  `xml_parser_soa.py`
-2.  `hmm/loader_soa.py`
-3.  `legacy/engine_soa.py`
-4.  Output log of `verify_soa_implementation.py` showing **[PASS]**.
+---
+
+### Task 2: Update `geometry.py`
+
+Replace the "Realistic" geometry with the "Legacy" geometry logic. Copy-paste this exact code.
+
+```python
+import numpy as np
+
+# Replicating EXACTLY legacy/utils.py logic
+_KEY_X_POS = np.zeros(128, dtype=np.float64)
+_IS_BLACK = np.zeros(128, dtype=bool)
+
+def _init_geometry():
+    keybsize = 16.5  # cm
+    k = keybsize / 7.0
+    
+    # Legacy Layout dictionary
+    _kb_layout = {
+        "C": 0.5, "D": 1.5, "E": 2.5, "F": 3.5, "G": 4.5, "A": 5.5, "B": 6.5,
+        "C#": 1.0, "D#": 2.0, "F#": 4.0, "G#": 5.0, "A#": 6.0
+    }
+    
+    # Simple mapping: 0=C, 1=C#, etc.
+    pc_names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+    
+    for pitch in range(128):
+        pc = pitch % 12
+        octave = (pitch // 12) - 1
+        name = pc_names[pc]
+        
+        step = _kb_layout[name] * k
+        # Formula from legacy/utils.py keypos()
+        pos = keybsize * octave + step
+        
+        _KEY_X_POS[pitch] = pos
+        _IS_BLACK[pitch] = '#' in name
+
+_init_geometry()
+
+def get_key_geometry(pitches: np.ndarray):
+    safe_p = np.clip(pitches, 0, 127)
+    x = np.ascontiguousarray(_KEY_X_POS[safe_p])
+    b = np.ascontiguousarray(_IS_BLACK[safe_p])
+    return x, b
+```
+
+---
+
+### Task 3: Update `xml_parser_soa.py`
+
+Populate the new musical time fields.
+
+**Action:** In the loop where you fill `soa` arrays:
+
+```python
+    # ... existing assignments ...
+    soa.onset_quarter[i] = note.onset      # PlayedNote.onset is in quarters
+    soa.duration_quarter[i] = note.duration # PlayedNote.duration is in quarters
+```
+
+---
+
+### Task 4: Fix `legacy/engine_soa.py`
+
+Remove the conversion hacks and use the correct data sources.
+
+**Action:** Modify `find_fingerings_soa`.
+
+```python
+def find_fingerings_soa(soa: ScoreData, hand_side: str) -> np.ndarray:
+    target_hand_int = HAND_RIGHT if hand_side == "right" else HAND_LEFT
+    mask = (soa.hand == target_hand_int)
+    
+    pitches = soa.pitch[mask]
+    
+    # USE NEW FIELDS: Musical Time
+    onsets = soa.onset_quarter[mask]
+    # Legacy scaling: main.py adapter multiplies duration by 4. Replicate this.
+    durations = soa.duration_quarter[mask] * 4.0 
+    
+    event_ids = soa.event_id[mask]
+    
+    if len(pitches) == 0:
+        return np.zeros(len(soa), dtype=np.int8)
+
+    # Geometry is now natively in CM (Legacy compatible)
+    x, is_black = get_key_geometry(pitches)
+    if hand_side == 'left':
+        x = -x
+
+    # --- DELETE ALL PREVIOUS NORMALIZATION CODE (x*0.1, time*2.0, etc) ---
+
+    # Calculate Chord logic (Same as before)
+    unique_ids, counts = np.unique(event_ids, return_counts=True)
+    counts_map = dict(zip(unique_ids, counts))
+    is_chord_arr = np.array([counts_map[eid] > 1 for eid in event_ids], dtype=bool)
+
+    hand_engine = HandSOA(x, onsets, durations, is_black, event_ids, is_chord_arr, side=hand_side, hf=0.82)
+    finger_path = hand_engine.generate()
+    
+    # ... Output assignment logic remains same ...
+```
+
+---
+
+### Verification
+
+After applying these 4 changes, run `verify_soa_advanced.py`.
+Expected result: `PASS` (or extremely high match rate > 99%).

@@ -5,7 +5,8 @@ import numba as nb
 ANCHORS = np.arange(-150, 151, 15, dtype=np.int32)
 
 # Average finger position relative to hand center (anchor) in pseudo-mm
-FINGER_BASE_POS = np.array([-40.0, -20.0, 0.0, 20.0, 40.0], dtype=np.float64)
+RH_FINGER_BASE_POS = np.array([-40.0, -20.0, 0.0, 20.0, 40.0], dtype=np.float64)
+LH_FINGER_BASE_POS = RH_FINGER_BASE_POS[::-1]  # Correct mirrored geometry for the left hand
 
 # Precomputed constant for Gaussian Normalization: 0.5 * log(2 * pi)
 HALF_LOG_2PI = 0.9189385332046727
@@ -28,31 +29,23 @@ def compute_emission_score(
     anchor_pos_x: float,
     finger_idx: int,
     rbf_mu: np.ndarray,
-    rbf_sigma: np.ndarray
+    rbf_sigma: np.ndarray,
+    finger_base_pos: np.ndarray
 ) -> float:
     """
     Computes the Log-PDF of the observed key position given the finger and anchor.
     Formula: ln(P(x)) = -ln(sigma) - 0.5*ln(2pi) - 0.5*((x-mu)/sigma)^2
     """
     sigma_min = 1.0
-
-    # 1. Calculate the target x-position of the finger
-    finger_target_pos = anchor_pos_x + FINGER_BASE_POS[finger_idx]
-
-    # 2. Calculate the spatial delta
+    finger_target_pos = anchor_pos_x + finger_base_pos[finger_idx]
     delta = note_coord_x - finger_target_pos
-
-    # 3. Get finger-specific RBF parameters
     mu = rbf_mu[finger_idx]
     sigma = rbf_sigma[finger_idx]
     if sigma < sigma_min:
         sigma = sigma_min
-
-    # 4. Log-Likelihood calculation
     variance = sigma * sigma
     log_norm = -np.log(sigma) - HALF_LOG_2PI
     quadratic = -((delta - mu) ** 2) / (2.0 * variance)
-
     return log_norm + quadratic
 
 @nb.njit(cache=True)

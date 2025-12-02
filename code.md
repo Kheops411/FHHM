@@ -8,7 +8,8 @@ import numba as nb
 ANCHORS = np.arange(-150, 151, 15, dtype=np.int32)
 
 # Average finger position relative to hand center (anchor) in pseudo-mm
-FINGER_BASE_POS = np.array([-40.0, -20.0, 0.0, 20.0, 40.0], dtype=np.float64)
+RH_FINGER_BASE_POS = np.array([-40.0, -20.0, 0.0, 20.0, 40.0], dtype=np.float64)
+LH_FINGER_BASE_POS = RH_FINGER_BASE_POS[::-1]  # Correct mirrored geometry for the left hand
 
 # Precomputed constant for Gaussian Normalization: 0.5 * log(2 * pi)
 HALF_LOG_2PI = 0.9189385332046727
@@ -31,31 +32,23 @@ def compute_emission_score(
     anchor_pos_x: float,
     finger_idx: int,
     rbf_mu: np.ndarray,
-    rbf_sigma: np.ndarray
+    rbf_sigma: np.ndarray,
+    finger_base_pos: np.ndarray
 ) -> float:
     """
     Computes the Log-PDF of the observed key position given the finger and anchor.
     Formula: ln(P(x)) = -ln(sigma) - 0.5*ln(2pi) - 0.5*((x-mu)/sigma)^2
     """
     sigma_min = 1.0
-
-    # 1. Calculate the target x-position of the finger
-    finger_target_pos = anchor_pos_x + FINGER_BASE_POS[finger_idx]
-
-    # 2. Calculate the spatial delta
+    finger_target_pos = anchor_pos_x + finger_base_pos[finger_idx]
     delta = note_coord_x - finger_target_pos
-
-    # 3. Get finger-specific RBF parameters
     mu = rbf_mu[finger_idx]
     sigma = rbf_sigma[finger_idx]
     if sigma < sigma_min:
         sigma = sigma_min
-
-    # 4. Log-Likelihood calculation
     variance = sigma * sigma
     log_norm = -np.log(sigma) - HALF_LOG_2PI
     quadratic = -((delta - mu) ** 2) / (2.0 * variance)
-
     return log_norm + quadratic
 
 @nb.njit(cache=True)
@@ -88,14 +81,6 @@ from .core import compute_emission_score, compute_inertia_cost, ANCHORS
 from .structural import N_FINGERS, N_ANCHORS
 
 @nb.njit(cache=True)
-def _clip(val, min_val, max_val):
-    if val < min_val:
-        return min_val
-    if val > max_val:
-        return max_val
-    return val
-
-@nb.njit(cache=True)
 def run_forward_pass(
     n_obs: int,
     notes_coord_x: np.ndarray,
@@ -108,66 +93,97 @@ def run_forward_pass(
     inertia_weight: float,
     rbf_mu: np.ndarray,
     rbf_sigma: np.ndarray,
-    smoothing_weight: float
+    smoothing_weight: float,
+    finger_base_pos: np.ndarray
 ):
-    """
-    Remplit le treillis Viterbi (log_probs et backpointers) en place.
-    """
+    if n_obs == 0:
+        return
 
-    # A. Initialisation (t = 0)
+    # A. Initialization (t = 0)
     current_note_coord_x = notes_coord_x[0]
     for f_curr in range(N_FINGERS):
         for k_curr in range(N_ANCHORS):
-            hand_pos_center_x = current_note_coord_x + ANCHORS[k_curr]
+            hand_pos_center_x_abs = current_note_coord_x + ANCHORS[k_curr]
             emit = compute_emission_score(
                 current_note_coord_x,
-                hand_pos_center_x,
+                hand_pos_center_x_abs,
                 f_curr,
                 rbf_mu,
-                rbf_sigma
+                rbf_sigma,
+                finger_base_pos
             )
             for f_prev in range(N_FINGERS):
                 lattice_log_probs[0, f_prev, f_curr, k_curr] = emit
 
-    # B. Récursion (t = 1 à n_obs - 1)
-    for t in range(1, n_obs):
+    if n_obs == 1:
+        return
+
+    # B. First Transition (t = 1) - Special Case
+    dt = notes_ontime[1] - notes_ontime[0]
+    current_note_coord_x = notes_coord_x[1]
+    prev_note_coord_x = notes_coord_x[0]
+    for f_curr in range(N_FINGERS):
+        for k_curr in range(N_ANCHORS):
+            hand_pos_center_x_curr_abs = current_note_coord_x + ANCHORS[k_curr]
+            emit = compute_emission_score(
+                current_note_coord_x,
+                hand_pos_center_x_curr_abs,
+                f_curr,
+                rbf_mu,
+                rbf_sigma,
+                finger_base_pos
+            )
+            for f_prev in range(N_FINGERS):
+                max_prob = -np.inf
+                best_k_prev = -1
+                for k_prev in range(N_ANCHORS):
+                    hand_center_x_prev_abs = prev_note_coord_x + ANCHORS[k_prev]
+                    dist = np.abs(hand_pos_center_x_curr_abs - hand_center_x_prev_abs)
+                    inertia = compute_inertia_cost(dist, dt, inertia_param_slope, inertia_param_center, inertia_weight)
+                    smoothing = np.abs(ANCHORS[k_curr] - ANCHORS[k_prev]) * smoothing_weight
+                    prev_prob = lattice_log_probs[0, 0, f_prev, k_prev]
+                    candidate = prev_prob - inertia - smoothing + emit
+                    if candidate > max_prob:
+                        max_prob = candidate
+                        best_k_prev = k_prev
+                lattice_log_probs[1, f_prev, f_curr, k_curr] = max_prob
+                lattice_backpointers[1, f_prev, f_curr, k_curr, 0] = -1
+                lattice_backpointers[1, f_prev, f_curr, k_curr, 1] = f_prev
+                lattice_backpointers[1, f_prev, f_curr, k_curr, 2] = best_k_prev
+
+    # C. Main Recursion (t >= 2)
+    for t in range(2, n_obs):
         dt = notes_ontime[t] - notes_ontime[t-1]
         current_note_coord_x = notes_coord_x[t]
         prev_note_coord_x = notes_coord_x[t-1]
-        
         for f_curr in range(N_FINGERS):
             for k_curr in range(N_ANCHORS):
-                hand_pos_center_x = current_note_coord_x + ANCHORS[k_curr]
+                hand_pos_center_x_curr_abs = current_note_coord_x + ANCHORS[k_curr]
                 emit = compute_emission_score(
                     current_note_coord_x,
-                    hand_pos_center_x,
+                    hand_pos_center_x_curr_abs,
                     f_curr,
                     rbf_mu,
-                    rbf_sigma
+                    rbf_sigma,
+                    finger_base_pos
                 )
-
                 for f_prev in range(N_FINGERS):
                     max_prob = -np.inf
                     best_k_prev = -1
                     best_f_prev2 = -1
-
                     for k_prev in range(N_ANCHORS):
-                        hand_center_x_prev = prev_note_coord_x + ANCHORS[k_prev]
-                        hand_center_x_curr = current_note_coord_x + ANCHORS[k_curr]
-                        dist = np.abs(hand_center_x_curr - hand_center_x_prev)
+                        hand_center_x_prev_abs = prev_note_coord_x + ANCHORS[k_prev]
+                        dist = np.abs(hand_pos_center_x_curr_abs - hand_center_x_prev_abs)
                         inertia = compute_inertia_cost(dist, dt, inertia_param_slope, inertia_param_center, inertia_weight)
-
                         for f_prev2 in range(N_FINGERS):
                             prev_prob = lattice_log_probs[t-1, f_prev2, f_prev, k_prev]
                             agility = agility_matrix[f_prev2, f_prev, f_curr]
                             smoothing = np.abs(ANCHORS[k_curr] - ANCHORS[k_prev]) * smoothing_weight
                             candidate = prev_prob + agility - inertia - smoothing + emit
-
                             if candidate > max_prob:
                                 max_prob = candidate
                                 best_k_prev = k_prev
                                 best_f_prev2 = f_prev2
-
                     lattice_log_probs[t, f_prev, f_curr, k_curr] = max_prob
                     lattice_backpointers[t, f_prev, f_curr, k_curr, 0] = best_f_prev2
                     lattice_backpointers[t, f_prev, f_curr, k_curr, 1] = f_prev
@@ -187,75 +203,114 @@ def run_constrained_forward_pass(
     inertia_weight: float,
     rbf_mu: np.ndarray,
     rbf_sigma: np.ndarray,
-    smoothing_weight: float
+    smoothing_weight: float,
+    finger_base_pos: np.ndarray
 ):
-    # A. Initialisation (t = 0)
+    if n_obs == 0:
+        return
+
+    # A. Initialization (t = 0)
     current_note_coord_x = notes_coord_x[0]
     f_init_range = range(N_FINGERS)
-    if true_fingers[0] != -999: # FINGER_UNKNOWN
+    if true_fingers[0] != -999:
         f_init_range = range(true_fingers[0] - 1, true_fingers[0])
-
     for f_curr in f_init_range:
         for k_curr in range(N_ANCHORS):
-            hand_pos_center_x = current_note_coord_x + ANCHORS[k_curr]
+            hand_pos_center_x_abs = current_note_coord_x + ANCHORS[k_curr]
             emit = compute_emission_score(
                 current_note_coord_x,
-                hand_pos_center_x,
+                hand_pos_center_x_abs,
                 f_curr,
                 rbf_mu,
-                rbf_sigma
+                rbf_sigma,
+                finger_base_pos
             )
             for f_prev in range(N_FINGERS):
                 lattice_log_probs[0, f_prev, f_curr, k_curr] = emit
 
-    # B. Récursion (t = 1 à n_obs - 1)
-    for t in range(1, n_obs):
+    if n_obs == 1:
+        return
+
+    # B. First Transition (t = 1)
+    dt = notes_ontime[1] - notes_ontime[0]
+    current_note_coord_x = notes_coord_x[1]
+    prev_note_coord_x = notes_coord_x[0]
+    f_curr_range = range(N_FINGERS)
+    if true_fingers[1] != -999:
+        f_curr_range = range(true_fingers[1] - 1, true_fingers[1])
+    f_prev_range = range(N_FINGERS)
+    if true_fingers[0] != -999:
+        f_prev_range = range(true_fingers[0] - 1, true_fingers[0])
+
+    for f_curr in f_curr_range:
+        for k_curr in range(N_ANCHORS):
+            hand_pos_center_x_curr_abs = current_note_coord_x + ANCHORS[k_curr]
+            emit = compute_emission_score(
+                current_note_coord_x,
+                hand_pos_center_x_curr_abs,
+                f_curr,
+                rbf_mu,
+                rbf_sigma,
+                finger_base_pos
+            )
+            for f_prev in f_prev_range:
+                max_prob = -np.inf
+                best_k_prev = -1
+                for k_prev in range(N_ANCHORS):
+                    hand_center_x_prev_abs = prev_note_coord_x + ANCHORS[k_prev]
+                    dist = np.abs(hand_pos_center_x_curr_abs - hand_center_x_prev_abs)
+                    inertia = compute_inertia_cost(dist, dt, inertia_param_slope, inertia_param_center, inertia_weight)
+                    smoothing = np.abs(ANCHORS[k_curr] - ANCHORS[k_prev]) * smoothing_weight
+                    prev_prob = lattice_log_probs[0, 0, f_prev, k_prev]
+                    candidate = prev_prob - inertia - smoothing + emit
+                    if candidate > max_prob:
+                        max_prob = candidate
+                        best_k_prev = k_prev
+                lattice_log_probs[1, f_prev, f_curr, k_curr] = max_prob
+                lattice_backpointers[1, f_prev, f_curr, k_curr, 0] = -1
+                lattice_backpointers[1, f_prev, f_curr, k_curr, 1] = f_prev
+                lattice_backpointers[1, f_prev, f_curr, k_curr, 2] = best_k_prev
+    
+    # C. Main Recursion (t >= 2)
+    for t in range(2, n_obs):
         dt = notes_ontime[t] - notes_ontime[t-1]
         current_note_coord_x = notes_coord_x[t]
         prev_note_coord_x = notes_coord_x[t-1]
-        
         f_curr_range = range(N_FINGERS)
         if true_fingers[t] != -999:
             f_curr_range = range(true_fingers[t] - 1, true_fingers[t])
-            
         f_prev_range = range(N_FINGERS)
         if true_fingers[t-1] != -999:
             f_prev_range = range(true_fingers[t-1] - 1, true_fingers[t-1])
 
         for f_curr in f_curr_range:
             for k_curr in range(N_ANCHORS):
-                hand_pos_center_x = current_note_coord_x + ANCHORS[k_curr]
+                hand_pos_center_x_curr_abs = current_note_coord_x + ANCHORS[k_curr]
                 emit = compute_emission_score(
                     current_note_coord_x,
-                    hand_pos_center_x,
+                    hand_pos_center_x_curr_abs,
                     f_curr,
                     rbf_mu,
-                    rbf_sigma
+                    rbf_sigma,
+                    finger_base_pos
                 )
-
                 for f_prev in f_prev_range:
                     max_prob = -np.inf
                     best_k_prev = -1
                     best_f_prev2 = -1
-
                     for k_prev in range(N_ANCHORS):
-                        hand_center_x_prev = prev_note_coord_x + ANCHORS[k_prev]
-                        hand_center_x_curr = current_note_coord_x + ANCHORS[k_curr]
-                        dist = np.abs(hand_center_x_curr - hand_center_x_prev)
+                        hand_center_x_prev_abs = prev_note_coord_x + ANCHORS[k_prev]
+                        dist = np.abs(hand_pos_center_x_curr_abs - hand_center_x_prev_abs)
                         inertia = compute_inertia_cost(dist, dt, inertia_param_slope, inertia_param_center, inertia_weight)
-
                         for f_prev2 in range(N_FINGERS):
                             prev_prob = lattice_log_probs[t-1, f_prev2, f_prev, k_prev]
                             agility = agility_matrix[f_prev2, f_prev, f_curr]
                             smoothing = np.abs(ANCHORS[k_curr] - ANCHORS[k_prev]) * smoothing_weight
-                            
                             candidate = prev_prob + agility - inertia - smoothing + emit
-
                             if candidate > max_prob:
                                 max_prob = candidate
                                 best_k_prev = k_prev
                                 best_f_prev2 = f_prev2
-
                     lattice_log_probs[t, f_prev, f_curr, k_curr] = max_prob
                     lattice_backpointers[t, f_prev, f_curr, k_curr, 0] = best_f_prev2
                     lattice_backpointers[t, f_prev, f_curr, k_curr, 1] = f_prev
@@ -297,13 +352,14 @@ def backtracking(
         k_curr = k_prev
 
     return opt_fingers, opt_anchors
+
 ```
 
 ### interface.py
 
 ```py
 import numpy as np
-from .core import SoftPositionModel
+from .core import SoftPositionModel, RH_FINGER_BASE_POS, LH_FINGER_BASE_POS
 from .structural import ViterbiLattice
 from .inference import run_forward_pass, backtracking
 from .utils import PITCH_TO_KEYPOS_LUT
@@ -314,11 +370,8 @@ def predict_fingering(
     model: SoftPositionModel,
     agility_matrix: np.ndarray = None,
     smoothing_weight: float = 0.0,
-    hand_sign: int = 1 # 1 pour main droite (RH), -1 pour main gauche (LH)
+    hand_sign: int = 1
 ):
-    """
-    API de haut niveau pour prédire le doigté d'une séquence de notes.
-    """
     n_obs = len(notes_pitch)
     if n_obs == 0:
         return np.array([], dtype=np.int32), np.array([], dtype=np.int32)
@@ -328,8 +381,12 @@ def predict_fingering(
         agility_matrix = np.zeros((5, 5, 5), dtype=np.float64)
 
     notes_coord_x = PITCH_TO_KEYPOS_LUT[notes_pitch, 0].copy()
+    
     if hand_sign == -1:
         notes_coord_x *= -1
+        finger_base_pos = LH_FINGER_BASE_POS
+    else:
+        finger_base_pos = RH_FINGER_BASE_POS
 
     run_forward_pass(
         n_obs=n_obs,
@@ -343,7 +400,8 @@ def predict_fingering(
         inertia_weight=model.inertia_weight,
         rbf_mu=model.rbf_mu,
         rbf_sigma=model.rbf_sigma,
-        smoothing_weight=smoothing_weight
+        smoothing_weight=smoothing_weight,
+        finger_base_pos=finger_base_pos
     )
 
     fingers, anchors = backtracking(
@@ -353,6 +411,7 @@ def predict_fingering(
     )
 
     return fingers * hand_sign, anchors
+
 ```
 
 ### structural.py
@@ -365,7 +424,6 @@ from .core import ANCHORS
 
 N_FINGERS = 5
 N_ANCHORS = len(ANCHORS)
-N_STATES = N_FINGERS * N_FINGERS * N_ANCHORS
 
 class ViterbiLattice:
     """
@@ -404,7 +462,7 @@ class ViterbiLattice:
 
 ```py
 import numpy as np
-from .core import SoftPositionModel, ANCHORS, FINGER_BASE_POS
+from .core import SoftPositionModel, ANCHORS, RH_FINGER_BASE_POS, LH_FINGER_BASE_POS
 from .structural import ViterbiLattice, N_FINGERS
 from .inference import run_constrained_forward_pass, backtracking
 from .utils import load_pig_file, apply_time_dep_pitch_order, FINGER_UNKNOWN, PITCH_TO_KEYPOS_LUT
@@ -433,10 +491,9 @@ class SoftPositionTrainer:
 
                 rh_notes = all_notes[all_notes['channel'] == 0]
                 lh_notes = all_notes[all_notes['channel'] == 1]
-                sequences_to_process = [rh_notes, lh_notes]
+                sequences_to_process = [(rh_notes, 'RH'), (lh_notes, 'LH')]
 
-                # MODIFIÉ: Utiliser enumerate pour identifier la main (0=RH, 1=LH)
-                for hand_idx, hand_notes in enumerate(sequences_to_process):
+                for hand_notes, hand_name in sequences_to_process:
                     if len(hand_notes) < 3:
                         continue
 
@@ -445,13 +502,15 @@ class SoftPositionTrainer:
                     notes_pitch = np.array([n['pitch'] for n in notes_sorted], dtype=np.int32)
                     notes_ontime = np.array([n['ontime'] for n in notes_sorted], dtype=np.float64)
 
-                    # MODIFIÉ: Préparer les coordonnées et les inverser pour la main gauche
                     notes_coord_x = PITCH_TO_KEYPOS_LUT[notes_pitch, 0].copy()
-                    if hand_idx == 1:  # Si c'est la main gauche
+                    if hand_name == 'LH':
                         notes_coord_x *= -1
+                        finger_base_pos_for_hand = LH_FINGER_BASE_POS
+                    else:
+                        finger_base_pos_for_hand = RH_FINGER_BASE_POS
 
                     true_fingers = np.array(
-                        [abs(n['finger']) if n['finger'] != FINGER_UNKNOWN else FINGER_UNKNOWN
+                        [abs(n['finger']) if n['finger'] != FINGER_UNKNOWN else FINGER_UNKNOWN # We use abs() because the hand (right/left) is determined by hand_name and the appropriate geometry is applied via finger_base_pos_for_hand
                          for n in notes_sorted],
                         dtype=np.int32
                     )
@@ -459,7 +518,7 @@ class SoftPositionTrainer:
                     lattice = ViterbiLattice(n_obs)
                     run_constrained_forward_pass(
                         n_obs=n_obs,
-                        notes_coord_x=notes_coord_x, # MODIFIÉ: Passer les coordonnées
+                        notes_coord_x=notes_coord_x,
                         notes_ontime=notes_ontime,
                         true_fingers=true_fingers,
                         lattice_log_probs=lattice.log_probs,
@@ -470,7 +529,8 @@ class SoftPositionTrainer:
                         inertia_weight=self.model.inertia_weight,
                         rbf_mu=self.model.rbf_mu,
                         rbf_sigma=self.model.rbf_sigma,
-                        smoothing_weight=smoothing_weight
+                        smoothing_weight=smoothing_weight,
+                        finger_base_pos=finger_base_pos_for_hand
                     )
 
                     final_log_prob = np.max(lattice.log_probs[-1])
@@ -484,7 +544,9 @@ class SoftPositionTrainer:
                             finger_idx = true_fingers[i] - 1
                             anchor_idx = opt_anchors[i]
                             
-                            delta = -ANCHORS[anchor_idx] - FINGER_BASE_POS[finger_idx]
+                            hand_pos_center_x = notes_coord_x[i] + ANCHORS[anchor_idx]
+                            finger_target_pos = hand_pos_center_x + finger_base_pos_for_hand[finger_idx]
+                            delta = notes_coord_x[i] - finger_target_pos
                             finger_deltas[finger_idx].append(delta)
 
                     for i in range(2, n_obs):
@@ -523,6 +585,7 @@ class SoftPositionTrainer:
         self.agility_matrix = np.log(probs + 1e-12)
         non_zeros = np.count_nonzero(counts)
         print(f"Agility Matrix updated. {non_zeros} active transitions learned.")
+
 ```
 
 ### utils.py

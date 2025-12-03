@@ -1,5 +1,4 @@
-# main.py
-
+# legacy.py
 import sys
 from typing import List, Optional
 from types import SimpleNamespace # <-- On utilise cet objet simple
@@ -108,7 +107,7 @@ if __name__ == '__main__':
         sys.exit(1)
 
     if len(sys.argv) < 3:
-        print("Usage: python main.py <input.xml> <output.xml>")
+        print("Usage: python legacy.py <input.xml> <output.xml>")
         sys.exit(1)
 
     input_file = sys.argv[1]

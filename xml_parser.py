@@ -367,7 +367,6 @@ class MusicXMLParser:
         self.part_states: Dict[int, PartState] = {}
         self.buffers: Dict[tuple, list] = {}
         self._chord_start_ticks = 0
-    
     def parse(self) -> List[PlayedNote]:
         """Parse MusicXML and generate PlayedNote timeline"""
         parts = self.root.findall('.//part')
@@ -416,7 +415,19 @@ class MusicXMLParser:
         if key is not None:
             fifths = safe_int(key.findtext('fifths'))
             state.keysig_map = key_fifths_to_alter_map(fifths)
-    
+    def _update_state_from_attributes(self, attributes_node: etree._Element, state: PartState):
+        """Update state directly from an attributes node found inside a measure"""
+        # Update divisions
+        divisions = attributes_node.findtext('divisions')
+        if divisions:
+            state.divisions = safe_int(divisions, DEFAULT_DIVISIONS)
+        
+        # Update key signature
+        key = attributes_node.find('key')
+        if key is not None:
+            fifths = safe_int(key.findtext('fifths'))
+            state.keysig_map = key_fifths_to_alter_map(fifths)
+
     def _process_measure(
         self,
         measure: etree._Element,
@@ -447,7 +458,11 @@ class MusicXMLParser:
             elif tag == 'forward':
                 duration = safe_int(child.findtext('duration'))
                 local_ticks += duration
-            
+            # --- CORRECTION DEBUT ---
+            elif tag == 'attributes':
+                # On traite les changements d'attributs (ex: divisions) au milieu de la mesure
+                self._update_state_from_attributes(child, state)
+            # --- CORRECTION FIN ---
             elif tag == 'direction':
                 self._process_direction(child, state)
             
@@ -527,7 +542,6 @@ class MusicXMLParser:
         # Duration and tuplets
         duration = safe_int(note.findtext('duration'))
         duration_factor = self._get_tuplet_factor(note)
-        
         # Voice and staff
         voice = note.findtext('voice', '1')
         staff = safe_int(note.findtext('staff'), 1)
@@ -1261,7 +1275,10 @@ class MusicXMLParser:
                 merged_note = self._create_played_note(
                     {'xml': note.xml_element, 'midi': note.pitch, 'voice': note.voice,
                      'staff': note.staff, 'measure_number': note.measure_number,
-                     'velocity': note.velocity, 'tempo': note.tempo},
+                     'velocity': note.velocity, 'tempo': note.tempo,
+                     'xml_fingering': note.finger #correction
+                     },
+                     
                     note.onset,
                     total_duration,
                     'tied_merged_note'
